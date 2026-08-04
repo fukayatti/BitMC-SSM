@@ -39,5 +39,5 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/your-username/BitMC-SSM"
-Documentation = "https://github.com/your-username/BitMC-SSM#readme"
+Homepage = "https://github.com/fukayatti/BitMC-SSM"
+Documentation = "https://github.com/fukayatti/BitMC-SSM#readme"

@@ -77,7 +77,7 @@ By unifying **BitNet v2 ($\mathcal{H}$-BitLinear)**, **Delta-SSM (Dual-Decay Rec
 No dependencies required! All you need is a C++20 compiler (`g++` or `clang++`):
 
 ```bash
-git clone https://github.com/your-username/BitMC-SSM.git
+git clone https://github.com/fukayatti/BitMC-SSM.git
 cd BitMC-SSM
 make
 ```
