@@ -1,0 +1,39 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# C++ Build outputs & binaries
+infer
+test_hadamard
+test_tmac
+*.o
+*.out
+*.exe
+build/
+dist/
+
+# Large Model weights & Checkpoints (download or export dynamically)
+*.pt
+*.pth
+*.ckpt
+*.bin
+
+# Environments
+.venv/
+venv/
+env/
+.env
+
+# Testing & Caches
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*~
