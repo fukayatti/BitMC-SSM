@@ -157,6 +157,7 @@ def main():
     parser = argparse.ArgumentParser(description="Bit-MC-SSM Training & Export")
     parser.add_argument("--epochs", type=int, default=5, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
+    parser.add_argument("--grad_accum_steps", type=int, default=1, help="Gradient accumulation steps")
     parser.add_argument("--d_model", type=int, default=128, help="Hidden dimension")
     parser.add_argument("--n_layers", type=int, default=4, help="Number of layers")
     parser.add_argument("--d_state", type=int, default=16, help="SSM state dimension")
@@ -164,12 +165,15 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--galore_rank", type=int, default=8, help="GaLore projection rank")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--amp", action="store_true", default=torch.cuda.is_available(), help="Enable Mixed Precision (BF16/FP16)")
+    parser.add_argument("--compile", action="store_true", default=False, help="Enable torch.compile acceleration")
     parser.add_argument("--out_bin", type=str, default="model.bin", help="Output 2-bit binary path")
     args = parser.parse_args()
 
     print("======================================================================")
-    print(f"⚡ Bit-MC-SSM Training on {args.device.upper()}")
+    print(f"⚡ Bit-MC-SSM Accelerated Training on {args.device.upper()}")
     print(f"   Config: d_model={args.d_model}, layers={args.n_layers}, d_state={args.d_state}")
+    print(f"   Optimizations: AMP={args.amp}, compile={args.compile}, grad_accum={args.grad_accum_steps}")
     print("======================================================================")
 
     model = BitMCSSM(
@@ -182,6 +186,14 @@ def main():
     total_params = sum(p.numel() for p in model.parameters())
     print(f"🧠 Total Model Parameters: {total_params:,}")
 
+    # Optional torch.compile (PyTorch 2.0+ automatic Triton kernel fusion)
+    if args.compile:
+        try:
+            print("🚀 Compiling model with torch.compile(mode='reduce-overhead')...")
+            model = torch.compile(model, mode="reduce-overhead")
+        except Exception as e:
+            print(f"⚠️ torch.compile not supported or failed: {e}")
+
     optimizer = GaLoreAdamW(
         model.parameters(),
         lr=args.lr,
@@ -191,25 +203,63 @@ def main():
     )
 
     dataset = SyntheticStoryDataset(num_samples=1000, seq_len=64, vocab_size=args.vocab_size)
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        pin_memory=(args.device == "cuda")
+    )
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=args.epochs * (len(dataloader) // args.grad_accum_steps + 1)
+    )
+
+    # AMP setup (prefer bfloat16 on Ampere+, float16 on older GPUs)
+    amp_dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
+    scaler = torch.amp.GradScaler("cuda", enabled=(args.amp and args.device == "cuda" and amp_dtype == torch.float16))
 
     for epoch in range(1, args.epochs + 1):
         model.train()
         total_loss = 0.0
+        optimizer.zero_grad()
         pbar = tqdm(dataloader, desc=f"Epoch [{epoch:02d}/{args.epochs:02d}]")
-        for inputs, targets in pbar:
-            inputs, targets = inputs.to(args.device), targets.to(args.device)
-            optimizer.zero_grad()
-            logits = model(inputs)
-            loss = F.cross_entropy(logits.view(-1, args.vocab_size), targets.view(-1))
-            loss.backward()
-            optimizer.step()
 
-            total_loss += loss.item()
-            ppl = math.exp(min(loss.item(), 100))
-            pbar.set_postfix({"loss": f"{loss.item():.4f}", "ppl": f"{ppl:.2f}"})
+        for step, (inputs, targets) in enumerate(pbar):
+            inputs = inputs.to(args.device, non_blocking=True)
+            targets = targets.to(args.device, non_blocking=True)
 
-    export_binary(model, args.out_bin)
+            with torch.amp.autocast(device_type=args.device, dtype=amp_dtype, enabled=args.amp):
+                logits = model(inputs)
+                loss = F.cross_entropy(logits.view(-1, args.vocab_size), targets.view(-1))
+                loss = loss / args.grad_accum_steps
+
+            if scaler.is_enabled():
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
+
+            if (step + 1) % args.grad_accum_steps == 0 or (step + 1) == len(dataloader):
+                if scaler.is_enabled():
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+
+                optimizer.zero_grad()
+                scheduler.step()
+
+            raw_loss = loss.item() * args.grad_accum_steps
+            total_loss += raw_loss
+            ppl = math.exp(min(raw_loss, 100))
+            pbar.set_postfix({"loss": f"{raw_loss:.4f}", "ppl": f"{ppl:.2f}"})
+
+    # Unwrap compiled model if needed for export
+    raw_model = getattr(model, "_orig_mod", model)
+    export_binary(raw_model, args.out_bin)
 
 
 if __name__ == "__main__":
