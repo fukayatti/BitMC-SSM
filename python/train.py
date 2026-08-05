@@ -40,6 +40,14 @@ try:
 except ImportError:
     HAS_CAUSAL_CONV1D = False
 
+try:
+    from triton_kernels import fused_delta_ssm_scan
+except ImportError:
+    try:
+        from .triton_kernels import fused_delta_ssm_scan
+    except ImportError:
+        fused_delta_ssm_scan = None
+
 
 class DeltaSSMBlock(nn.Module):
     def __init__(self, d_model: int, d_state: int = 32, tau: float = 0.85):
@@ -77,14 +85,17 @@ class DeltaSSMBlock(nn.Module):
         x_in = B_t * u_scalar
 
         if cached_state is None:
-            # Ultra-fast Vectorized Parallel Causal Scan (Zero Python Loops on GPU)
-            t_idx = torch.arange(L, device=x.device)
-            diff = (t_idx[:, None] - t_idx[None, :]).clamp(min=0)
-            mask = (t_idx[:, None] >= t_idx[None, :]).float()
-            decay_mat = (decay.view(1, 1, -1) ** diff.unsqueeze(-1)) * mask.unsqueeze(-1)
-            h_seq = torch.einsum('l k s, b k s -> b l s', decay_mat, x_in)
-            y_t = (C_t * h_seq).sum(dim=-1, keepdim=True)
-            next_state = h_seq[:, -1, :]
+            if fused_delta_ssm_scan is not None and x.is_cuda:
+                y_t, next_state = fused_delta_ssm_scan(x_in, decay, C_t)
+            else:
+                # Vectorized Parallel Causal Scan fallback
+                t_idx = torch.arange(L, device=x.device)
+                diff = (t_idx[:, None] - t_idx[None, :]).clamp(min=0)
+                mask = (t_idx[:, None] >= t_idx[None, :]).float()
+                decay_mat = (decay.view(1, 1, -1) ** diff.unsqueeze(-1)) * mask.unsqueeze(-1)
+                h_seq = torch.einsum('l k s, b k s -> b l s', decay_mat, x_in)
+                y_t = (C_t * h_seq).sum(dim=-1, keepdim=True)
+                next_state = h_seq[:, -1, :]
         else:
             # Step-by-step state update for token-by-token cached inference
             h = cached_state

@@ -78,11 +78,23 @@ class QuantizeWeightTernary(torch.autograd.Function):
         return grad_output, None, None
 
 
+# Import Triton fused kernel suite
+try:
+    from .triton_kernels import fused_hadamard_act4, fused_ternary_quant
+except ImportError:
+    try:
+        from triton_kernels import fused_hadamard_act4, fused_ternary_quant
+    except ImportError:
+        fused_hadamard_act4 = None
+        fused_ternary_quant = None
+
+
 class HBitLinear(nn.Linear):
     """
     H-BitLinear Layer (BitNet v2)
     Applies Fast Walsh-Hadamard Transform (FWHT) prior to 4-bit activation quantization,
     effectively suppressing outlier channels into a Gaussian distribution.
+    Accelerated with Triton GPU kernels where available.
     """
     def __init__(self, in_features: int, out_features: int, bias: bool = False, tau: float = 0.85, use_hadamard: bool = True):
         super().__init__(in_features, out_features, bias=bias)
@@ -94,17 +106,21 @@ class HBitLinear(nn.Linear):
         nn.init.normal_(self.weight, std=math.sqrt(2.0 / (in_features + out_features)))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 1. Apply Online Fast Hadamard Transformation if enabled
-        if self.use_hadamard:
-            x_h = fast_hadamard_transform(x, scale=self.hadamard_scale)
+        # 1 & 2. Fused Hadamard Transform + 4-bit Activation Quantization
+        if fused_hadamard_act4 is not None:
+            x_q = fused_hadamard_act4(x, use_hadamard=self.use_hadamard)
         else:
-            x_h = x
-
-        # 2. 4-bit Activation Quantization (INT4: -8..7)
-        x_q = QuantizeAct4Bit.apply(x_h)
+            if self.use_hadamard:
+                x_h = fast_hadamard_transform(x, scale=self.hadamard_scale)
+            else:
+                x_h = x
+            x_q = QuantizeAct4Bit.apply(x_h)
 
         # 3. 1.58-bit Ternary Weight Quantization
-        w_q = QuantizeWeightTernary.apply(self.weight, self.tau)
+        if fused_ternary_quant is not None:
+            w_q = fused_ternary_quant(self.weight, self.tau)
+        else:
+            w_q = QuantizeWeightTernary.apply(self.weight, self.tau)
 
         # 4. Multiply (Zero-GEMM in C++ engine)
         return F.linear(x_q, w_q, self.bias)
