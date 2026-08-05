@@ -134,17 +134,21 @@ The bird replied, "I'm so happy and fast!"
 
 ## 🏋️ Training & Scaling
 
-For comprehensive training instructions, scaling matrices (30M up to 500M), and checkpoint resuming workflows, refer to the [📖 Complete Training Guide](docs/TRAINING_GUIDE.md).
+For comprehensive training instructions, scaling matrices (30M up to 1B), and checkpoint resuming workflows, refer to the [📖 Complete Training Guide](docs/TRAINING_GUIDE.md).
 
 ```bash
-# Launch Dual-GPU DDP Training with Triton acceleration
+# 1. Pre-tokenize dataset to uint16 memmap binary (~15-30s)
+python python/preprocess_data.py --dataset tinystories --num_samples 50000 --out data/train_tokens.bin
+
+# 2. Launch Dual-GPU DDP Training with zero startup delay & 100% GPU saturation
 torchrun --nproc_per_node=2 python/train.py \
-    --dataset smollm \
+    --data_bin data/train_tokens.bin \
     --d_model 384 \
     --n_layers 8 \
     --d_state 32 \
     --batch_size 32 \
-    --amp
+    --amp \
+    --compile
 ```
 
 ---

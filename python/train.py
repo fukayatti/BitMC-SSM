@@ -315,8 +315,9 @@ def main():
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device")
     parser.add_argument("--amp", action="store_true", help="Enable Automatic Mixed Precision (FP16/BF16)")
     parser.add_argument("--compile", action="store_true", help="Enable PyTorch 2.0+ torch.compile()")
-    parser.add_argument("--dataset", type=str, default="synthetic", choices=["synthetic", "smollm"], help="Dataset")
-    parser.add_argument("--dataset_subset", type=str, default="cosmopedia-v2", help="SmolLM subset")
+    parser.add_argument("--dataset", type=str, default="synthetic", choices=["synthetic", "smollm", "tinystories"], help="Dataset")
+    parser.add_argument("--dataset_subset", type=str, default="cosmopedia-v2", help="SmolLM subset (cosmopedia-v2, stories, etc.)")
+    parser.add_argument("--data_bin", type=str, default=None, help="Path to pre-tokenized memory-mapped .bin file (e.g. data/tinystories.bin)")
     parser.add_argument("--num_samples", type=int, default=25000, help="Number of samples/sequences")
     parser.add_argument("--seq_len", type=int, default=128, help="Sequence length")
     parser.add_argument("--chunk_size", type=int, default=64, help="Chunk size for fused chunked cross-entropy loss")
@@ -435,14 +436,45 @@ def main():
         update_proj_gap=50
     )
 
-    if args.dataset == "smollm":
+    if args.data_bin and os.path.exists(args.data_bin):
+        class PretokenizedMemmapDataset(Dataset):
+            def __init__(self, bin_path: str, seq_len: int = 128, max_samples: int = -1):
+                self.seq_len = seq_len
+                self.data = np.memmap(bin_path, dtype=np.uint16, mode="r")
+                self.total_tokens = len(self.data)
+                total_chunks = (self.total_tokens - 1) // seq_len
+                if max_samples > 0:
+                    self.num_samples = min(total_chunks, max_samples)
+                else:
+                    self.num_samples = total_chunks
+
+            def __len__(self):
+                return self.num_samples
+
+            def __getitem__(self, idx):
+                start = idx * self.seq_len
+                chunk = self.data[start : start + self.seq_len + 1].astype(np.int64)
+                x = torch.from_numpy(chunk[:-1])
+                y = torch.from_numpy(chunk[1:])
+                return x, y
+
+        if is_master:
+            print(f"⚡ Loading pre-tokenized memory-mapped binary: {args.data_bin}")
+        dataset = PretokenizedMemmapDataset(args.data_bin, seq_len=args.seq_len, max_samples=args.num_samples)
+        if is_master:
+            print(f"📊 Total Available Samples: {len(dataset):,} ({dataset.total_tokens:,} tokens)")
+    elif args.dataset in ["smollm", "tinystories"]:
         from datasets import load_dataset
         from transformers import GPT2TokenizerFast
 
         if is_master:
-            print(f"📥 Loading SmolLM corpus ({args.dataset_subset})...")
+            target_ds = "roneneldan/TinyStories" if args.dataset == "tinystories" else f"HuggingFaceTB/smollm-corpus ({args.dataset_subset})"
+            print(f"📥 Loading dataset: {target_ds}...")
         tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
-        raw_data = load_dataset("HuggingFaceTB/smollm-corpus", args.dataset_subset, split="train", streaming=True)
+        if args.dataset == "tinystories":
+            raw_data = load_dataset("roneneldan/TinyStories", split="train", streaming=True)
+        else:
+            raw_data = load_dataset("HuggingFaceTB/smollm-corpus", args.dataset_subset, split="train", streaming=True)
 
         samples = []
         count = 0

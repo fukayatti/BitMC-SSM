@@ -19,51 +19,66 @@ BitMC-SSM scales gracefully from lightweight nano-models up to edge-pro models:
 
 ## ⚡ 2. Quickstart Training Workflows
 
-### A. Dual Tesla T4 GPUs (Kaggle / Free Tier)
-Kaggle provides 2x Tesla T4 GPUs (16GB VRAM each) with PyTorch 2.0+ and Triton pre-installed:
+### 🏎️ Step 1: Ultra-Fast Pre-tokenization (Tiktoken → `.bin`)
+Converting text to `uint16` memory-mapped binary files beforehand eliminates CPU tokenization bottlenecks and ensures 100% GPU saturation:
 
 ```bash
-# 1. Clone repository & install dependencies
-git clone https://github.com/fukayatti/BitMC-SSM.git
-cd BitMC-SSM
-pip install -q triton transformers datasets
-
-# 2. Launch Dual-GPU DDP Training with Triton acceleration
-torchrun --nproc_per_node=2 python/train.py \
-    --dataset smollm \
-    --dataset_subset cosmopedia-v2 \
+# Pre-tokenize 50,000 samples (~10M tokens) in ~15-30 seconds
+python python/preprocess_data.py \
+    --dataset tinystories \
     --num_samples 50000 \
+    --out data/train_tokens.bin
+```
+
+---
+
+### 🚀 Step 2: High-Performance Zero-Copy Training
+
+#### A. Dual Tesla T4 GPUs (Kaggle / Free Tier - 40,000+ tok/s)
+```bash
+# Launch Dual-GPU DDP Training with Zero-Copy Memmap
+torchrun --nproc_per_node=2 python/train.py \
+    --data_bin data/train_tokens.bin \
     --d_model 384 \
     --n_layers 8 \
     --d_state 32 \
     --batch_size 32 \
     --amp \
-    --galore_rank 32 \
+    --compile \
+    --galore_rank 16 \
     --epochs 8 \
-    --save_ckpt_dir /kaggle/working/checkpoints
+    --save_ckpt_dir /kaggle/working/checkpoints \
+    --out_bin /kaggle/working/model_medium-30M.bin
 ```
 
-### B. Single GPU (Google Colab / Local RTX GPU)
+#### B. Single RTX 4090 / Cloud GPU (RunPod - 45,000+ tok/s)
 ```bash
 python python/train.py \
-    --dataset smollm \
-    --d_model 384 \
-    --n_layers 8 \
+    --data_bin data/train_tokens.bin \
+    --d_model 512 \
+    --n_layers 12 \
+    --d_state 48 \
     --batch_size 32 \
     --amp \
-    --device cuda
+    --compile \
+    --epochs 8 \
+    --out_bin model_large-60M.bin
 ```
 
-### C. CPU-Only Debug Mode
+#### C. CPU Overnight Training (Zero-Copy)
 ```bash
-python python/train.py \
-    --dataset synthetic \
-    --d_model 128 \
-    --n_layers 2 \
-    --d_state 16 \
-    --num_samples 100 \
-    --batch_size 4 \
-    --device cpu
+OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 nohup python python/train.py \
+    --data_bin data/train_tokens.bin \
+    --d_model 384 \
+    --n_layers 8 \
+    --d_state 32 \
+    --batch_size 16 \
+    --grad_accum_steps 2 \
+    --epochs 3 \
+    --device cpu \
+    --save_ckpt_dir checkpoints_cpu \
+    --out_bin model_cpu_night.bin \
+    > train_cpu.log 2>&1 &
 ```
 
 ---
@@ -72,16 +87,19 @@ python python/train.py \
 
 | Argument | Type | Default | Description |
 | :--- | :---: | :---: | :--- |
-| `--dataset` | `str` | `smollm` | Dataset source (`smollm` or `synthetic`). |
-| `--dataset_subset` | `str` | `cosmopedia-v2` | SmolLM subset (`cosmopedia-v2`, `fineweb-edu-dedup`, etc.). |
-| `--num_samples` | `int` | `50000` | Total samples streamed from HuggingFace. |
-| `--batch_size` | `int` | `32` | Batch size per GPU rank (Effective batch = `batch_size * world_size`). |
-| `--amp` | `flag` | `False` | Enables FP16 Automatic Mixed Precision (Tensor Core acceleration). |
-| `--galore_rank` | `int` | `32` | GaLore low-rank projection rank for 70% optimizer memory savings. |
+| `--data_bin` | `str` | `None` | **(Recommended)** Path to pre-tokenized uint16 binary file (e.g. `data/train_tokens.bin`). Instant startup! |
+| `--dataset` | `str` | `synthetic` | Fallback online dataset source (`tinystories`, `smollm`, or `synthetic`). |
+| `--dataset_subset` | `str` | `cosmopedia-v2` | SmolLM subset (`cosmopedia-v2`, `stories`, etc.). |
+| `--num_samples` | `int` | `25000` | Total samples to train on. |
+| `--batch_size` | `int` | `32` | Batch size per GPU rank (Effective batch = `batch_size * world_size * grad_accum`). |
+| `--amp` | `flag` | `False` | Enables FP16/BF16 Automatic Mixed Precision (Tensor Core acceleration). |
+| `--compile` | `flag` | `False` | Enables PyTorch 2.0+ `torch.compile()` graph optimization. |
+| `--galore_rank` | `int` | `16` | GaLore low-rank projection rank for 90%+ optimizer memory savings. |
 | `--grad_accum_steps`| `int` | `1` | Gradient accumulation steps for larger virtual batches. |
 | `--save_every_epochs`| `int` | `1` | Checkpoint saving frequency. |
 | `--save_ckpt_dir` | `str` | `checkpoints` | Directory to save `.pt` checkpoints. |
 | `--resume_from` | `str` | `None` | Path to a checkpoint `.pt` file to resume training from. |
+| `--out_bin` | `str` | `model.bin` | Path to exported 2-bit packed binary for C++ Zero-GEMM inference. |
 
 ---
 

@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <random>
 #include <numeric>
+#include <unordered_map>
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
@@ -388,74 +389,226 @@ public:
 };
 
 // ==============================================================================
-// 4. Tokenizer & JSON Parser
+// 4. Tokenizer & JSON Parser (Full GPT-2 BPE + UTF-8 Byte Decode)
 // ==============================================================================
 
 struct SimpleTokenizer {
     std::vector<std::string> id_to_token;
+    std::unordered_map<std::string, uint32_t> token_to_id;
+    std::unordered_map<uint32_t, uint8_t> unicode_to_byte;
+    std::unordered_map<uint8_t, std::string> byte_to_unicode_str;
+    bool is_initialized = false;
+
+    void init_byte_mappings() {
+        if (is_initialized) return;
+        is_initialized = true;
+
+        std::vector<int> bs;
+        for (int b = '!'; b <= '~'; ++b) bs.push_back(b);
+        for (int b = 161; b <= 172; ++b) bs.push_back(b);
+        for (int b = 174; b <= 255; ++b) bs.push_back(b);
+
+        std::vector<int> cs = bs;
+        int n = 0;
+        for (int b = 0; b < 256; ++b) {
+            if (std::find(bs.begin(), bs.end(), b) == bs.end()) {
+                bs.push_back(b);
+                cs.push_back(256 + n);
+                n++;
+            }
+        }
+
+        for (size_t i = 0; i < bs.size(); ++i) {
+            uint32_t codepoint = static_cast<uint32_t>(cs[i]);
+            uint8_t byte_val = static_cast<uint8_t>(bs[i]);
+            unicode_to_byte[codepoint] = byte_val;
+
+            // Encode codepoint to UTF-8 string
+            std::string utf8_char = "";
+            if (codepoint < 0x80) {
+                utf8_char += static_cast<char>(codepoint);
+            } else if (codepoint < 0x800) {
+                utf8_char += static_cast<char>(0xC0 | (codepoint >> 6));
+                utf8_char += static_cast<char>(0x80 | (codepoint & 0x3F));
+            } else {
+                utf8_char += static_cast<char>(0xE0 | (codepoint >> 12));
+                utf8_char += static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F));
+                utf8_char += static_cast<char>(0x80 | (codepoint & 0x3F));
+            }
+            byte_to_unicode_str[byte_val] = utf8_char;
+        }
+    }
+
+    static std::string parse_json_string(const std::string& s, size_t& pos) {
+        std::string res;
+        pos++; // skip opening '"'
+        while (pos < s.size()) {
+            char c = s[pos++];
+            if (c == '"') {
+                return res;
+            } else if (c == '\\' && pos < s.size()) {
+                char esc = s[pos++];
+                if (esc == '"') res += '"';
+                else if (esc == '\\') res += '\\';
+                else if (esc == '/') res += '/';
+                else if (esc == 'b') res += '\b';
+                else if (esc == 'f') res += '\f';
+                else if (esc == 'n') res += '\n';
+                else if (esc == 'r') res += '\r';
+                else if (esc == 't') res += '\t';
+                else if (esc == 'u' && pos + 4 <= s.size()) {
+                    std::string hex = s.substr(pos, 4);
+                    pos += 4;
+                    try {
+                        uint32_t cp = std::stoul(hex, nullptr, 16);
+                        if (cp < 0x80) {
+                            res += static_cast<char>(cp);
+                        } else if (cp < 0x800) {
+                            res += static_cast<char>(0xC0 | (cp >> 6));
+                            res += static_cast<char>(0x80 | (cp & 0x3F));
+                        } else {
+                            res += static_cast<char>(0xE0 | (cp >> 12));
+                            res += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+                            res += static_cast<char>(0x80 | (cp & 0x3F));
+                        }
+                    } catch (...) {}
+                }
+            } else {
+                res += c;
+            }
+        }
+        return res;
+    }
 
     bool load_vocab(const std::string& path, uint32_t vocab_size) {
+        init_byte_mappings();
         id_to_token.assign(vocab_size, "");
+        token_to_id.clear();
+
         std::ifstream f(path);
         if (!f.is_open()) return false;
 
         std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
         size_t pos = 0;
+        size_t n = content.size();
 
-        // Parse: "token_str": token_id
-        while ((pos = content.find('"', pos)) != std::string::npos) {
-            size_t end_key = content.find('"', pos + 1);
-            if (end_key == std::string::npos) break;
-            std::string key = content.substr(pos + 1, end_key - pos - 1);
+        while (pos < n) {
+            while (pos < n && content[pos] != '"') pos++;
+            if (pos >= n) break;
 
-            size_t colon = content.find(':', end_key);
-            if (colon == std::string::npos) break;
+            std::string key = parse_json_string(content, pos);
 
-            size_t val_start = colon + 1;
-            while (val_start < content.size() && (content[val_start] == ' ' || content[val_start] == '\t' || content[val_start] == '\n')) {
-                val_start++;
+            while (pos < n && (content[pos] == ' ' || content[pos] == '\t' || content[pos] == '\r' || content[pos] == '\n' || content[pos] == ':')) {
+                pos++;
             }
-            size_t val_end = val_start;
-            while (val_end < content.size() && isdigit(content[val_end])) {
-                val_end++;
-            }
+            if (pos >= n) break;
 
-            if (val_end > val_start) {
-                std::string num_str = content.substr(val_start, val_end - val_start);
+            if (content[pos] == '"') {
+                // "key": "value" format (inverted index)
+                std::string val = parse_json_string(content, pos);
+                try {
+                    uint32_t id = std::stoul(key);
+                    if (id < vocab_size) {
+                        id_to_token[id] = val;
+                        token_to_id[val] = id;
+                    }
+                } catch (...) {}
+            } else if (isdigit(content[pos]) || content[pos] == '-') {
+                // "token": id format (standard GPT-2 encoder.json)
+                size_t num_start = pos;
+                while (pos < n && isdigit(content[pos])) pos++;
+                std::string num_str = content.substr(num_start, pos - num_start);
                 try {
                     uint32_t id = std::stoul(num_str);
                     if (id < vocab_size) {
                         id_to_token[id] = key;
+                        token_to_id[key] = id;
                     }
                 } catch (...) {}
             }
-            pos = val_end;
         }
-        return true;
+
+        return !token_to_id.empty();
     }
 
     std::string decode_token(uint32_t id) const {
         if (id >= id_to_token.size() || id_to_token[id].empty()) {
             return "[" + std::to_string(id) + "]";
         }
-        std::string raw = id_to_token[id];
-        std::string out = "";
-        for (size_t i = 0; i < raw.size(); ++i) {
-            // GPT-2 BPE space: Ġ (\xc4\xa0)
-            if (static_cast<unsigned char>(raw[i]) == 0xC4 && i + 1 < raw.size() && static_cast<unsigned char>(raw[i+1]) == 0xA0) {
-                out += " ";
-                i++;
-            } else if (static_cast<unsigned char>(raw[i]) == 0xC4 && i + 1 < raw.size() && static_cast<unsigned char>(raw[i+1]) == 0x8A) {
-                out += "\n";
-                i++;
-            } else if (raw[i] == '\\' && i + 1 < raw.size() && raw[i+1] == 'n') {
-                out += "\n";
-                i++;
+
+        const std::string& raw = id_to_token[id];
+        std::string decoded_bytes;
+
+        size_t i = 0;
+        while (i < raw.size()) {
+            unsigned char c0 = static_cast<unsigned char>(raw[i]);
+            uint32_t cp = 0;
+            size_t char_len = 1;
+
+            if (c0 < 0x80) {
+                cp = c0;
+                char_len = 1;
+            } else if ((c0 & 0xE0) == 0xC0 && i + 1 < raw.size()) {
+                unsigned char c1 = static_cast<unsigned char>(raw[i+1]);
+                cp = ((c0 & 0x1F) << 6) | (c1 & 0x3F);
+                char_len = 2;
+            } else if ((c0 & 0xF0) == 0xE0 && i + 2 < raw.size()) {
+                unsigned char c1 = static_cast<unsigned char>(raw[i+1]);
+                unsigned char c2 = static_cast<unsigned char>(raw[i+2]);
+                cp = ((c0 & 0x0F) << 12) | ((c1 & 0x3F) << 6) | (c2 & 0x3F);
+                char_len = 3;
+            }
+
+            auto it = unicode_to_byte.find(cp);
+            if (it != unicode_to_byte.end()) {
+                decoded_bytes += static_cast<char>(it->second);
+                i += char_len;
             } else {
-                out += raw[i];
+                for (size_t k = 0; k < char_len; ++k) {
+                    decoded_bytes += raw[i + k];
+                }
+                i += char_len;
             }
         }
-        return out;
+
+        return decoded_bytes;
+    }
+
+    std::vector<uint32_t> encode(const std::string& text) const {
+        std::vector<uint32_t> tokens;
+        if (token_to_id.empty() || text.empty()) return tokens;
+
+        // Convert input text to GPT-2 unicode string
+        std::string bpe_str = "";
+        for (unsigned char c : text) {
+            auto it = byte_to_unicode_str.find(c);
+            if (it != byte_to_unicode_str.end()) {
+                bpe_str += it->second;
+            } else {
+                bpe_str += static_cast<char>(c);
+            }
+        }
+
+        // Greedy longest matching
+        size_t pos = 0;
+        while (pos < bpe_str.size()) {
+            bool matched = false;
+            size_t max_len = std::min(static_cast<size_t>(64), bpe_str.size() - pos);
+            for (size_t len = max_len; len > 0; --len) {
+                std::string sub = bpe_str.substr(pos, len);
+                auto it = token_to_id.find(sub);
+                if (it != token_to_id.end()) {
+                    tokens.push_back(it->second);
+                    pos += len;
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) {
+                pos++;
+            }
+        }
+        return tokens;
     }
 };
 
@@ -463,15 +616,44 @@ struct SimpleTokenizer {
 // 5. Sampling
 // ==============================================================================
 
-uint32_t sample_logits(float* logits, uint32_t vocab_size, float temperature, uint32_t top_k, std::mt19937& rng) {
+// ==============================================================================
+// 5. Sampling (Top-K, Top-P Nucleus, & Repetition Penalty)
+// ==============================================================================
+
+uint32_t sample_logits(
+    float* logits,
+    uint32_t vocab_size,
+    float temperature,
+    uint32_t top_k,
+    float top_p,
+    const std::vector<uint32_t>& recent_tokens,
+    float rep_penalty,
+    std::mt19937& rng
+) {
+    // 1. Apply Repetition Penalty
+    if (rep_penalty > 1.0f) {
+        for (uint32_t tok : recent_tokens) {
+            if (tok < vocab_size) {
+                if (logits[tok] > 0.0f) {
+                    logits[tok] /= rep_penalty;
+                } else {
+                    logits[tok] *= rep_penalty;
+                }
+            }
+        }
+    }
+
+    // 2. Greedy if zero temperature
     if (temperature < 1e-4f) {
         return static_cast<uint32_t>(std::distance(logits, std::max_element(logits, logits + vocab_size)));
     }
 
+    // 3. Apply Temperature
     for (uint32_t i = 0; i < vocab_size; ++i) {
         logits[i] /= temperature;
     }
 
+    // 4. Sort candidates
     std::vector<std::pair<float, uint32_t>> pairs(vocab_size);
     for (uint32_t i = 0; i < vocab_size; ++i) {
         pairs[i] = {logits[i], i};
@@ -482,6 +664,7 @@ uint32_t sample_logits(float* logits, uint32_t vocab_size, float temperature, ui
         return a.first > b.first;
     });
 
+    // 5. Compute Softmax over Top-K
     float max_l = pairs[0].first;
     float sum_exp = 0.0f;
     std::vector<float> probs(k);
@@ -493,10 +676,31 @@ uint32_t sample_logits(float* logits, uint32_t vocab_size, float temperature, ui
         probs[i] /= sum_exp;
     }
 
+    // 6. Top-P (Nucleus) Truncation
+    float cum_p = 0.0f;
+    uint32_t cutoff_k = k;
+    for (uint32_t i = 0; i < k; ++i) {
+        cum_p += probs[i];
+        if (cum_p >= top_p) {
+            cutoff_k = i + 1;
+            break;
+        }
+    }
+
+    // Renormalize after Top-P
+    float p_sum = 0.0f;
+    for (uint32_t i = 0; i < cutoff_k; ++i) {
+        p_sum += probs[i];
+    }
+    for (uint32_t i = 0; i < cutoff_k; ++i) {
+        probs[i] /= p_sum;
+    }
+
+    // 7. Sample
     std::uniform_real_distribution<float> dist(0.0f, 1.0f);
     float r = dist(rng);
     float cdf = 0.0f;
-    for (uint32_t i = 0; i < k; ++i) {
+    for (uint32_t i = 0; i < cutoff_k; ++i) {
         cdf += probs[i];
         if (r <= cdf) {
             return pairs[i].second;
@@ -517,11 +721,17 @@ int main(int argc, char** argv) {
     }
 
     uint32_t max_gen_tokens = 60;
-    float temperature = 0.75f;
+    std::string user_prompt = "";
+    float temperature = 0.7f;
     uint32_t top_k = 40;
+    float top_p = 0.9f;
+    float rep_penalty = 1.15f;
 
     if (argc > 1) model_path = argv[1];
     if (argc > 2) max_gen_tokens = std::stoi(argv[2]);
+    if (argc > 3) user_prompt = argv[3];
+    if (argc > 4) temperature = std::stof(argv[4]);
+    if (argc > 5) top_k = std::stoi(argv[5]);
 
     std::cout << "===========================================================================\n";
     std::cout << "⚡ Bit-MC-SSM Native C++20 / Zero-GEMM Inference Engine\n";
@@ -535,7 +745,9 @@ int main(int argc, char** argv) {
     SimpleTokenizer tokenizer;
     bool has_vocab = tokenizer.load_vocab(vocab_path, model.config.vocab_size);
     if (has_vocab) {
-        std::cout << "📖 Loaded " << vocab_path << " (" << model.config.vocab_size << " tokens)\n";
+        std::cout << "📖 Loaded " << vocab_path << " (" << tokenizer.token_to_id.size() << " tokens)\n";
+    } else {
+        std::cerr << "⚠️ Warning: " << vocab_path << " not found or empty. Outputting token IDs.\n";
     }
 
     ModelRuntimeState state;
@@ -544,9 +756,15 @@ int main(int argc, char** argv) {
     std::vector<float> logits(model.config.vocab_size);
     std::mt19937 rng(42);
 
-    // Warmup prompt tokens: "Once upon a time, Lily saw a tiny"
-    // Token IDs in GPT-2: Once (7454), upon (2402), a (257), time (640), , (11), Lily (20037), saw (2497), a (257), tiny (44152)
-    std::vector<uint32_t> prompt_tokens = {7454, 2402, 257, 640, 11, 20037, 2497, 257, 44152};
+    std::vector<uint32_t> prompt_tokens;
+    if (!user_prompt.empty() && has_vocab) {
+        prompt_tokens = tokenizer.encode(user_prompt);
+    }
+    if (prompt_tokens.empty()) {
+        // Default warm-up prompt: "Once upon a time, Lily saw a tiny"
+        prompt_tokens = {7454, 2402, 257, 640, 11, 20037, 2497, 257, 44152};
+    }
+
     for (auto& tok : prompt_tokens) {
         tok %= model.config.vocab_size;
     }
@@ -564,21 +782,28 @@ int main(int argc, char** argv) {
     std::cout << "\n▶️ Generating " << max_gen_tokens << " new tokens (Live Streaming via Zero-GEMM SIMD):\n";
     std::cout << "---------------------------------------------------------------------------\n";
 
-    // Print Prompt
+    // Print Prompt to Stream
     for (uint32_t tok : prompt_tokens) {
         std::cout << tokenizer.decode_token(tok);
     }
     std::cout << std::flush;
 
-    uint32_t cur_tok = sample_logits(logits.data(), model.config.vocab_size, temperature, top_k, rng);
+    std::vector<uint32_t> recent_tokens = prompt_tokens;
+
+    uint32_t cur_tok = sample_logits(logits.data(), model.config.vocab_size, temperature, top_k, top_p, recent_tokens, rep_penalty, rng);
     std::cout << tokenizer.decode_token(cur_tok) << std::flush;
+    recent_tokens.push_back(cur_tok);
 
     auto gen_start = std::chrono::high_resolution_clock::now();
 
     for (uint32_t step_i = 0; step_i < max_gen_tokens; ++step_i) {
         model.step(cur_tok, state, logits.data());
-        cur_tok = sample_logits(logits.data(), model.config.vocab_size, temperature, top_k, rng);
+        cur_tok = sample_logits(logits.data(), model.config.vocab_size, temperature, top_k, top_p, recent_tokens, rep_penalty, rng);
         std::cout << tokenizer.decode_token(cur_tok) << std::flush;
+        recent_tokens.push_back(cur_tok);
+        if (recent_tokens.size() > 64) {
+            recent_tokens.erase(recent_tokens.begin());
+        }
     }
 
     auto t_end = std::chrono::high_resolution_clock::now();
@@ -596,3 +821,4 @@ int main(int argc, char** argv) {
 
     return 0;
 }
+
