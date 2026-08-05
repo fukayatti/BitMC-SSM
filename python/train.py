@@ -207,6 +207,9 @@ def main():
     parser.add_argument("--dataset_subset", type=str, default="cosmopedia-v2", help="SmolLM subset")
     parser.add_argument("--num_samples", type=int, default=25000, help="Number of samples/sequences")
     parser.add_argument("--seq_len", type=int, default=128, help="Sequence length")
+    parser.add_argument("--save_ckpt_dir", type=str, default=None, help="Directory to save PyTorch checkpoints (.pt)")
+    parser.add_argument("--save_every_epochs", type=int, default=1, help="Epoch interval for saving checkpoints")
+    parser.add_argument("--resume_from", type=str, default=None, help="Path to checkpoint .pt file to resume from")
     parser.add_argument("--out_bin", type=str, default="model.bin", help="Output 2-bit binary path")
     args = parser.parse_args()
 
@@ -240,6 +243,10 @@ def main():
         print(f"   Optimizations: AMP={args.amp}, compile={args.compile}, grad_accum={args.grad_accum_steps}")
         print(f"   Dataset: {args.dataset} ({args.dataset_subset if args.dataset == 'smollm' else 'synthetic'}), Samples={args.num_samples:,}")
         print(f"   Effective Batch Size: {args.batch_size * args.grad_accum_steps * world_size}")
+        if args.save_ckpt_dir:
+            print(f"   Checkpoint Saving: every {args.save_every_epochs} epoch(s) to '{args.save_ckpt_dir}'")
+        if args.resume_from:
+            print(f"   Resuming from: '{args.resume_from}'")
         print("======================================================================")
 
     model = BitMCSSM(
@@ -248,6 +255,25 @@ def main():
         n_layers=args.n_layers,
         d_state=args.d_state
     ).to(device)
+
+    start_epoch = 1
+    best_loss = float("inf")
+
+    # Resume from checkpoint if specified
+    if args.resume_from and os.path.exists(args.resume_from):
+        if is_master:
+            print(f"🔄 Loading checkpoint from {args.resume_from}...")
+        ckpt = torch.load(args.resume_from, map_location=device)
+        if "model_state_dict" in ckpt:
+            model.load_state_dict(ckpt["model_state_dict"])
+            start_epoch = ckpt.get("epoch", 0) + 1
+            best_loss = ckpt.get("loss", float("inf"))
+            if is_master:
+                print(f"✅ Checkpoint loaded! Resuming from Epoch {start_epoch}")
+        else:
+            model.load_state_dict(ckpt)
+            if is_master:
+                print("✅ Model weights loaded successfully!")
 
     total_params = sum(p.numel() for p in model.parameters())
     if is_master:
@@ -278,6 +304,10 @@ def main():
         rank=args.galore_rank,
         update_proj_gap=50
     )
+
+    # Optimizer state
+    # Note: GaLore creates fresh low-rank subspace projections on the fly from current gradients,
+    # ensuring clean and stable continuation across different DDP rank topologies.
 
     if args.dataset == "smollm":
         from datasets import load_dataset
@@ -338,7 +368,11 @@ def main():
     device_type = "cuda" if "cuda" in device else "cpu"
     scaler = torch.amp.GradScaler("cuda", enabled=(args.amp and device_type == "cuda" and amp_dtype == torch.float16))
 
-    for epoch in range(1, args.epochs + 1):
+    if args.resume_from and os.path.exists(args.resume_from) and "scaler_state_dict" in ckpt:
+        if scaler.is_enabled() and ckpt.get("scaler_state_dict"):
+            scaler.load_state_dict(ckpt["scaler_state_dict"])
+
+    for epoch in range(start_epoch, args.epochs + 1):
         if is_distributed and sampler is not None:
             sampler.set_epoch(epoch)
 
@@ -379,6 +413,38 @@ def main():
             if is_master:
                 ppl = math.exp(min(raw_loss, 100))
                 pbar.set_postfix({"loss": f"{raw_loss:.4f}", "ppl": f"{ppl:.2f}"})
+
+        # Epoch checkpointing (Master Rank)
+        if is_master and args.save_ckpt_dir:
+            os.makedirs(args.save_ckpt_dir, exist_ok=True)
+            avg_epoch_loss = total_loss / max(1, len(dataloader))
+            raw_model = model.module if is_distributed else model
+            raw_model = getattr(raw_model, "_orig_mod", raw_model)
+
+            ckpt_payload = {
+                "epoch": epoch,
+                "model_state_dict": raw_model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scaler_state_dict": scaler.state_dict() if scaler.is_enabled() else None,
+                "config": vars(args),
+                "loss": avg_epoch_loss
+            }
+
+            # Save latest checkpoint
+            last_path = os.path.join(args.save_ckpt_dir, "ckpt_last.pt")
+            torch.save(ckpt_payload, last_path)
+
+            # Save best checkpoint
+            if avg_epoch_loss < best_loss:
+                best_loss = avg_epoch_loss
+                best_path = os.path.join(args.save_ckpt_dir, "ckpt_best.pt")
+                torch.save(ckpt_payload, best_path)
+
+            # Save periodic checkpoint
+            if epoch % args.save_every_epochs == 0:
+                epoch_path = os.path.join(args.save_ckpt_dir, f"ckpt_epoch_{epoch:02d}.pt")
+                torch.save(ckpt_payload, epoch_path)
+                print(f"💾 Checkpoint saved: {epoch_path} (Loss: {avg_epoch_loss:.4f})")
 
     if is_distributed:
         torch.distributed.destroy_process_group()
