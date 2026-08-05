@@ -34,6 +34,13 @@ class RMSNorm(nn.Module):
         return x * torch.rsqrt(variance + self.eps) * self.weight
 
 
+try:
+    from causal_conv1d import causal_conv1d_fn
+    HAS_CAUSAL_CONV1D = True
+except ImportError:
+    HAS_CAUSAL_CONV1D = False
+
+
 class DeltaSSMBlock(nn.Module):
     def __init__(self, d_model: int, d_state: int = 32, tau: float = 0.85):
         super().__init__()
@@ -51,24 +58,46 @@ class DeltaSSMBlock(nn.Module):
         proj = self.in_proj(x)
         u, gate = proj.chunk(2, dim=-1)
 
-        u_conv = self.conv1d(u.transpose(1, 2))[:, :, :L].transpose(1, 2)
-        u_conv = F.silu(u_conv)
+        # Fast-path: use Tri Dao's fused CUDA causal_conv1d_fn if available
+        if HAS_CAUSAL_CONV1D and u.is_cuda:
+            u_conv = causal_conv1d_fn(
+                u.transpose(1, 2).contiguous(),
+                self.conv1d.weight.squeeze(1),
+                self.conv1d.bias,
+                activation="silu"
+            ).transpose(1, 2)
+        else:
+            u_conv = self.conv1d(u.transpose(1, 2))[:, :, :L].transpose(1, 2)
+            u_conv = F.silu(u_conv)
 
         B_t = self.b_proj(u_conv)
         C_t = self.c_proj(u_conv)
         decay = torch.sigmoid(self.decay_fast)
-
-        h = cached_state if cached_state is not None else torch.zeros(B, self.d_state, device=x.device, dtype=x.dtype)
-        y_list = []
         u_scalar = u_conv.mean(dim=-1, keepdim=True)
-        for t in range(L):
-            h = decay * h + B_t[:, t, :] * u_scalar[:, t, :]
-            y_t = (C_t[:, t, :] * h).sum(dim=-1, keepdim=True)
-            y_list.append(y_t)
+        x_in = B_t * u_scalar
 
-        y_ssm = torch.cat(y_list, dim=-1).unsqueeze(-1).expand(-1, -1, D)
+        if cached_state is None:
+            # Ultra-fast Vectorized Parallel Causal Scan (Zero Python Loops on GPU)
+            t_idx = torch.arange(L, device=x.device)
+            diff = (t_idx[:, None] - t_idx[None, :]).clamp(min=0)
+            mask = (t_idx[:, None] >= t_idx[None, :]).float()
+            decay_mat = (decay.view(1, 1, -1) ** diff.unsqueeze(-1)) * mask.unsqueeze(-1)
+            h_seq = torch.einsum('l k s, b k s -> b l s', decay_mat, x_in)
+            y_t = (C_t * h_seq).sum(dim=-1, keepdim=True)
+            next_state = h_seq[:, -1, :]
+        else:
+            # Step-by-step state update for token-by-token cached inference
+            h = cached_state
+            y_list = []
+            for t in range(L):
+                h = decay * h + x_in[:, t, :]
+                y_list.append((C_t[:, t, :] * h).sum(dim=-1, keepdim=True))
+            y_t = torch.stack(y_list, dim=1)
+            next_state = h
+
+        y_ssm = y_t.expand(-1, -1, D)
         y = (u_conv + y_ssm) * F.silu(gate)
-        return self.out_proj(y), h
+        return self.out_proj(y), next_state
 
 
 class BitMCSSMBlock(nn.Module):
