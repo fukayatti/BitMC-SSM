@@ -351,12 +351,22 @@ def main():
     is_master = (rank == 0)
 
     if is_master:
+        has_cuda = torch.cuda.is_available() and device != "cpu"
+        triton_active = (fused_cross_entropy is not None and has_cuda)
+
         print("======================================================================")
         print(f"⚡ Bit-MC-SSM Training on {world_size}x Device(s) (DDP={is_distributed}, backend={backend if is_distributed else 'none'})")
         print(f"   Config: d_model={args.d_model}, layers={args.n_layers}, d_state={args.d_state}")
         print(f"   Optimizations: AMP={args.amp}, compile={args.compile}, grad_accum={args.grad_accum_steps}, chunk_loss={args.chunk_size}")
         print(f"   Dataset: {args.dataset} ({args.dataset_subset if args.dataset == 'smollm' else 'synthetic'}), Samples={args.num_samples:,}")
         print(f"   Effective Batch Size: {args.batch_size * args.grad_accum_steps * world_size}")
+        print("----------------------------------------------------------------------")
+        print("🚀 Kernel Acceleration Engine Status:")
+        print(f"   • Fused Flash Cross-Entropy : {'[⚡ ACTIVE (Triton SRAM)]' if triton_active else '[🛡️ FALLBACK (PyTorch)]'}")
+        print(f"   • Fused Delta-SSM Scan     : {'[⚡ ACTIVE (Triton Scan)]' if (fused_delta_ssm_scan is not None and has_cuda) else '[🛡️ FALLBACK (PyTorch)]'}")
+        print(f"   • Fused RMSNorm & SiLU     : {'[⚡ ACTIVE (Triton Fused)]' if triton_active else '[🛡️ FALLBACK (PyTorch)]'}")
+        print(f"   • CausalConv1D Engine      : {'[⚡ ACTIVE (CUDA Kernel)]' if HAS_CAUSAL_CONV1D else '[🛡️ FALLBACK (PyTorch Depthwise)]'}")
+        print("----------------------------------------------------------------------")
         if args.save_ckpt_dir:
             print(f"   Checkpoint Saving: every {args.save_every_epochs} epoch(s) to '{args.save_ckpt_dir}'")
         if args.resume_from:
