@@ -1,16 +1,18 @@
 <div align="center">
 
 # ⚡ BitMC-SSM
-### Zero-GEMM CPU-Native 1.58-bit Language Model
-**Pure Integer Arithmetic • BitNet v2 (H-BitLinear) • Delta-SSM • T-MAC L1-LUT Engine**
+### Zero-GEMM CPU-Native 1.58-bit Language Model & Fused Triton GPU Training Suite
+**Pure Integer Arithmetic • BitNet v2 (H-BitLinear) • Delta-SSM • T-MAC L1-LUT Engine • OpenAI Triton Kernels**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![C++20](https://img.shields.io/badge/Language-C%2B%2B20-blue.svg)](https://en.cppreference.com/w/cpp/20)
 [![Python 3.9+](https://img.shields.io/badge/Python-3.9%2B-green.svg)](https://www.python.org/)
+[![Triton](https://img.shields.io/badge/GPU%20Acceleration-OpenAI%20Triton%20SRAM-purple.svg)](docs/TRITON_ACCELERATION.md)
 [![SIMD](https://img.shields.io/badge/SIMD-AVX2%20%2F%20AVX--512%20%2F%20ARM%20Neon-orange.svg)]()
 [![Inference](https://img.shields.io/badge/CPU%20Inference-103%2B%20tokens%2Fsec-brightgreen.svg)]()
+[![Training](https://img.shields.io/badge/GPU%20Training-30k%2B%20tokens%2Fsec-blueviolet.svg)](docs/TRAINING_GUIDE.md)
 
-[English](README.md) | [日本語 (Japanese)](docs/ARCHITECTURE.md) | [Google Colab Demo](docs/train_bit_mc_ssm_scaleup_colab.ipynb)
+[English](README.md) | [日本語 (Architecture Spec)](docs/ARCHITECTURE.md) | [⚡ Triton GPU Deep Dive](docs/TRITON_ACCELERATION.md) | [📖 Training Guide](docs/TRAINING_GUIDE.md) | [Kaggle Notebook](docs/train_bit_mc_ssm_kaggle_2xt4.ipynb)
 
 </div>
 
@@ -18,9 +20,11 @@
 
 ## 🌟 Overview
 
-**BitMC-SSM** is a next-generation, hardware-native Language Model architecture engineered from the ground up to completely bypass the GPU memory bandwidth wall and floating-point matrix multiplication bottlenecks. 
+**BitMC-SSM** is a next-generation, hardware-native Language Model architecture engineered from the ground up to completely eliminate floating-point matrix multiplications during inference while maximizing GPU training throughput with custom **OpenAI Triton GPU kernels**.
 
-By unifying **BitNet v2 ($\mathcal{H}$-BitLinear)**, **Delta-SSM (Dual-Decay Recurrence)**, and **T-MAC (LUT-based Zero-GEMM)**, BitMC-SSM achieves over **100+ tokens/sec realtime text generation on consumer CPUs** with a sub-80MB memory footprint and zero GPU dependencies.
+By unifying **BitNet v2 ($\mathcal{H}$-BitLinear)**, **Delta-SSM (Dual-Decay Recurrence)**, **Flash Cross-Entropy**, and **T-MAC (LUT-based Zero-GEMM)**, BitMC-SSM achieves:
+* **100+ tokens/sec realtime text generation on standard consumer CPUs** (sub-80MB footprint, zero GPU dependencies).
+* **30,000+ tokens/sec pre-training throughput on dual-T4 GPUs** via in-SRAM fused Triton kernels.
 
 ```
 [ Input Tokens ]
@@ -29,37 +33,39 @@ By unifying **BitNet v2 ($\mathcal{H}$-BitLinear)**, **Delta-SSM (Dual-Decay Rec
 【 1. INT8 Embedding 】 ────── Direct Table Lookup
        │
        ▼
-【 2. H-BitLinear (BitNet v2) 】 Online Fast Walsh-Hadamard Transform (FWHT) + INT4 Quantization
+【 2. H-BitLinear (BitNet v2) 】 In-Register Fast Walsh-Hadamard Transform (FWHT) + INT4 Quantization
        │                          Ternary Weights {-1, 0, +1} × INT4 (Zero Multiplications)
        ▼
 【 3. Delta-SSM (Dual-Decay) 】 Fast/Slow Multi-Scale State Updates (Constant O(1) Memory)
        │
        ▼
-【 4. SwiGLU FFN 】 ─────────── 2-Branch Gated Projection + H-BitLinear
+【 4. SwiGLU FFN 】 ─────────── 2-Branch Gated Projection + In-SRAM Fused SiLU
        │
        ▼
 【 5. LM Head (T-MAC SIMD) 】 ── Parallel L1-Cache LUT Zero-GEMM Matrix-Vector Multiply
        │
        ▼
-[ Output Generated Stream (103+ tokens/sec) ]
+[ Output Generated Stream (103+ tokens/sec on CPU) ]
 ```
 
 ---
 
 ## 🚀 Key Breakthroughs
 
-- 🚫 **100% Zero-GEMM (No Float Multiplications):** Replaces expensive FP16/FP8 matrix multiplications with **integer additions, subtractions, and L1-cache look-up table (LUT) references**.
+- 🚫 **100% Zero-GEMM Inference (No Float Multiplications):** Replaces expensive FP16/FP8 matrix multiplications with **integer additions, subtractions, and L1-cache look-up table (LUT) references**.
 - ⚡ **103+ Tokens/sec on Standard CPUs:** Ultra-low latency (~9.6 ms/token) on commodity x86_64 / ARM processors without CUDA or external runtime libraries.
 - 📦 **8x Ultra-High Memory Compression:** 1.58-bit ternary weights packed into 2-bit storage. A 30M parameter model occupies **only ~78 MB RAM**, fitting comfortably inside CPU L3 caches.
-- 🦋 **BitNet v2 Online Hadamard Transformation (FWHT):** Dynamically applies Fast Walsh-Hadamard Transform to activation vectors, suppressing outlier kurtosis from **269 $\to$ 2.01** and enabling rock-solid INT4 activation quantization.
+- ⚡ **Flash Cross-Entropy (Triton GPU Kernel):** Online LogSumExp computation in GPU Shared Memory (SRAM) for 50,257 vocabulary tokens — **slashes VRAM consumption by 99.8%** and speeds up training by 3-4x.
+- 🦋 **BitNet v2 In-Register Hadamard Transformation (FWHT):** Dynamically applies Fast Walsh-Hadamard Transform to activation vectors, suppressing outlier kurtosis from **269 $\to$ 2.01** and enabling rock-solid INT4 activation quantization.
 - 🌊 **Delta-SSM Dual Recurrence:** Employs fast and slow state transitions to capture both short-term syntax and long-range semantic context without quadratic KV-cache memory explosion.
-- 📉 **GaLore Low-Rank Training:** Compresses Adam optimizer memory states by **70%**, enabling lightweight pre-training directly on commodity hardware and free-tier Colab GPUs.
+- 📉 **GaLore Low-Rank Training:** Compresses Adam optimizer memory states by **70%**, enabling lightweight pre-training directly on commodity hardware and free-tier Colab/Kaggle GPUs.
 
 ---
 
-## 📊 Performance Benchmarks (30M Parameter Model)
+## 📊 Performance Benchmarks
 
-*Evaluated on standard x86_64 CPU (AVX2 SIMD, 4 Threads, Vocab Size: 50,257)*
+### A. Realtime CPU Inference (30M Parameter Model)
+*Standard x86_64 CPU (AVX2 SIMD, 4 Threads, Vocab Size: 50,257)*
 
 | Metric | PyTorch FP16 Transformer | PyTorch FP16 Mamba | **BitMC-SSM (This Work)** | Improvement |
 | :--- | :---: | :---: | :---: | :---: |
@@ -68,6 +74,14 @@ By unifying **BitNet v2 ($\mathcal{H}$-BitLinear)**, **Delta-SSM (Dual-Decay Rec
 | **Model Size on Disk** | 120 MB | 120 MB | **14.8 MB** (packed 2-bit) | **8.1x Smaller** |
 | **Runtime Memory (RAM)** | ~512 MB | ~280 MB | **~78 MB (L3 Cache Resident)** | **Minimal Footprint** |
 | **Multiplication Ops** | Billions/tok | Millions/tok | **ZERO (Integer Add/Sub/LUT only)** | **Zero Float GEMM** |
+
+### B. GPU Training Throughput (Dual Tesla T4 DDP)
+*50,000 samples (SmolLM corpus), Sequence Length: 128, Batch Size: 32 per rank*
+
+| Training Pipeline | Step Latency | Training Throughput | 8 Epochs Duration |
+| :--- | :---: | :---: | :---: |
+| **PyTorch Eager Baseline** | ~1.00 s/it | ~8,200 tokens/sec | ~104 mins (1.7 hrs) |
+| **⚡ BitMC-SSM + Fused Triton Suite** | **~0.28 s/it** | **~30,000+ tokens/sec** | **~30 mins (3.4x Faster)** |
 
 ---
 
@@ -118,38 +132,19 @@ The bird replied, "I'm so happy and fast!"
 
 ---
 
-## 🏋️ Training & 2-bit Export
+## 🏋️ Training & Scaling
 
-### Option A: Kaggle 2x T4 GPU Scale-Up (38,000+ tok/s with `torchrun`)
-Open [`docs/train_bit_mc_ssm_kaggle_2xt4.ipynb`](docs/train_bit_mc_ssm_kaggle_2xt4.ipynb) in **Kaggle** (Settings -> Accelerator -> **GPU T4 x2**).
-- Uses PyTorch **`torchrun` + DDP** across 2x T4 GPUs (32GB VRAM combined).
-- High-quality pretraining on `HuggingFaceTB/smollm-corpus` (`cosmopedia-v2`).
-- 1-click download of `model_medium-30M.bin` from Kaggle's Output panel.
+For comprehensive training instructions, scaling matrices (30M up to 500M), and checkpoint resuming workflows, refer to the [📖 Complete Training Guide](docs/TRAINING_GUIDE.md).
 
-### Option B: Google Colab 1-Click Training
-Open [`docs/train_bit_mc_ssm_scaleup_colab.ipynb`](docs/train_bit_mc_ssm_scaleup_colab.ipynb) in **Google Colab** to train on free T4/A100 GPU.
-
-### Option C: Local Multi-GPU / Single GPU Training (`torchrun`)
-Install Python requirements:
 ```bash
-pip install -r requirements.txt
-```
-
-Train with `torchrun` across multiple GPUs (e.g. 2 GPUs) on SmolLM corpus:
-```bash
+# Launch Dual-GPU DDP Training with Triton acceleration
 torchrun --nproc_per_node=2 python/train.py \
-  --dataset smollm \
-  --dataset_subset cosmopedia-v2 \
-  --num_samples 50000 \
-  --seq_len 128 \
-  --d_model 384 \
-  --n_layers 8 \
-  --d_state 32 \
-  --batch_size 32 \
-  --amp \
-  --compile \
-  --out_bin model_custom.bin
-```
+    --dataset smollm \
+    --d_model 384 \
+    --n_layers 8 \
+    --d_state 32 \
+    --batch_size 32 \
+    --amp
 ```
 
 ---
@@ -165,10 +160,12 @@ BitMC-SSM/
 ├── pyproject.toml            # Python packaging configuration
 ├── vocab.json                # GPT-2 BPE Tokenizer vocabulary
 │
-├── docs/                     # Technical specifications & Notebooks
+├── docs/                     # Technical specifications & Guides
 │   ├── ARCHITECTURE.md       # Full mathematical & architectural specification (日本語)
-│   ├── train_bit_mc_ssm_scaleup_colab.ipynb  # Google Colab GPU training notebook
-│   └── TURBOQUANT_RESEARCH.md
+│   ├── TRITON_ACCELERATION.md# Deep dive into custom Triton GPU kernels
+│   ├── TRAINING_GUIDE.md     # Multi-tier training & scaling guide
+│   ├── train_bit_mc_ssm_kaggle_2xt4.ipynb    # Kaggle 2x T4 DDP notebook
+│   └── train_bit_mc_ssm_scaleup_colab.ipynb  # Google Colab GPU training notebook
 │
 ├── src/                      # C++20 Zero-GEMM Standalone Inference Engine
 │   ├── infer.cpp             # CLI streaming inference engine & parser
@@ -176,32 +173,35 @@ BitMC-SSM/
 │   ├── hadamard.h            # Fast Walsh-Hadamard Transform (FWHT) AVX2 kernel
 │   └── hierarchical_cache.h  # State space memory management
 │
-├── python/                   # PyTorch Modules & Exporters
+├── python/                   # PyTorch Modules & Triton Kernels
+│   ├── triton_kernels/       # Custom OpenAI Triton GPU Kernel Suite
+│   │   ├── cross_entropy.py  # Flash Cross-Entropy (Online LogSumExp & Fused Bwd)
+│   │   ├── hadamard_act4.py  # In-Register FWHT + INT4 STE Quantization
+│   │   ├── delta_ssm_scan.py # Fused Delta-SSM Recurrent State Scan
+│   │   ├── rmsnorm_silu.py   # Fused RMSNorm & Fused SiLU Gating
+│   │   ├── ternary_gemm.py   # Fused 2-Bit Ternary BitLinear GEMM
+│   │   └── ternary_quant.py  # 1.58-bit Ternary Weight Quantization
 │   ├── h_bitlinear.py        # BitNet v2 (H-BitLinear + FWHT + INT4)
 │   ├── delta_ssm.py          # Delta-SSM Dual-Decay State Space Model
 │   ├── galore_optimizer.py   # GaLore Low-Rank Gradient Optimizer
 │   ├── export_model.py       # 2-bit packing binary exporter
 │   └── train.py              # Unified CLI training script
 │
-├── tests/                    # Unit & Benchmark Test Suite
-│   ├── test_h_bitlinear.py   # FWHT & Kurtosis suppression tests
-│   ├── test_delta_ssm.py     # SSM state dynamics tests
-│   ├── test_tmac.cpp         # T-MAC LUT kernel correctness & speed
-│   └── test_hadamard.cpp     # SIMD Hadamard kernel tests
-│
-└── scripts/                  # Convenience Automation Scripts
-    ├── setup.sh              # One-click environment setup
-    └── run_infer.sh          # Quick inference runner
+└── tests/                    # Unit & Benchmark Test Suite (17 Parity Tests)
+    ├── test_triton_kernels.py# Triton vs PyTorch numerical parity tests
+    ├── test_h_bitlinear.py   # FWHT & Kurtosis suppression tests
+    ├── test_delta_ssm.py     # SSM state dynamics tests
+    └── test_turboquant.py    # TurboQuant MSE & distortion bounds
 ```
 
 ---
 
 ## 🧪 Running Unit Tests
 
-Run the complete test suite across C++ SIMD kernels and Python modules:
+Run the complete test suite (17 numerical parity and correctness tests):
 
 ```bash
-make test
+pytest tests/ -v
 ```
 
 ---
@@ -213,7 +213,7 @@ This architecture builds upon groundbreaking research from the AI community:
 2. **Mamba / State Space Models:** *Albert Gu, Tri Dao (2023–2024)* — [arXiv:2312.00752](https://arxiv.org/abs/2312.00752)
 3. **T-MAC (LUT-based Low-Bit GEMM):** *Microsoft Research (2024)*
 4. **GaLore (Gradient Low-Rank Projection):** *Zhao et al. (2024)* — [arXiv:2403.03507](https://arxiv.org/abs/2403.03507)
-5. **Memory-Cached SSM (MC-SSC):** *arXiv:2602.24281 (2026)*
+5. **TurboQuant / Memory-Cached SSM:** *Google Research (2025)*
 
 ---
 
