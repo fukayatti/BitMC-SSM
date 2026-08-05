@@ -41,12 +41,25 @@ except ImportError:
     HAS_CAUSAL_CONV1D = False
 
 try:
-    from triton_kernels import fused_delta_ssm_scan
+    from triton_kernels import (
+        fused_delta_ssm_scan,
+        fused_cross_entropy,
+        FusedRMSNorm,
+        fused_silu_gating,
+    )
 except ImportError:
     try:
-        from .triton_kernels import fused_delta_ssm_scan
+        from .triton_kernels import (
+            fused_delta_ssm_scan,
+            fused_cross_entropy,
+            FusedRMSNorm,
+            fused_silu_gating,
+        )
     except ImportError:
         fused_delta_ssm_scan = None
+        fused_cross_entropy = None
+        FusedRMSNorm = RMSNorm
+        fused_silu_gating = None
 
 
 class DeltaSSMBlock(nn.Module):
@@ -114,9 +127,9 @@ class DeltaSSMBlock(nn.Module):
 class BitMCSSMBlock(nn.Module):
     def __init__(self, d_model: int, d_state: int = 32, tau: float = 0.85):
         super().__init__()
-        self.norm1 = RMSNorm(d_model)
+        self.norm1 = FusedRMSNorm(d_model)
         self.ssm = DeltaSSMBlock(d_model=d_model, d_state=d_state, tau=tau)
-        self.norm2 = RMSNorm(d_model)
+        self.norm2 = FusedRMSNorm(d_model)
         self.ffn_in = HBitLinear(d_model, d_model * 4, tau=tau, use_hadamard=False)
         self.ffn_out = HBitLinear(d_model * 2, d_model, tau=tau, use_hadamard=True)
 
@@ -125,7 +138,11 @@ class BitMCSSMBlock(nn.Module):
         x = x + ssm_out
         ffn_p = self.ffn_in(self.norm2(x))
         f1, f2 = ffn_p.chunk(2, dim=-1)
-        x = x + self.ffn_out(F.silu(f1) * f2)
+        if fused_silu_gating is not None and x.is_cuda:
+            gated = fused_silu_gating(f1, f2)
+        else:
+            gated = F.silu(f1) * f2
+        x = x + self.ffn_out(gated)
         return x, next_state
 
 
@@ -142,7 +159,7 @@ class BitMCSSM(nn.Module):
             BitMCSSMBlock(d_model=d_model, d_state=d_state, tau=tau)
             for _ in range(n_layers)
         ])
-        self.final_norm = RMSNorm(d_model)
+        self.final_norm = FusedRMSNorm(d_model)
         self.lm_head = HBitLinear(d_model, vocab_size, tau=tau, use_hadamard=False)
 
     def extract_features(self, idx: torch.Tensor):
@@ -161,11 +178,17 @@ class BitMCSSM(nn.Module):
         flat_targets = targets.view(-1)
         total_tokens = flat_targets.numel()
 
+        # Fused Flash Cross-Entropy (Triton)
+        if fused_cross_entropy is not None and flat_hidden.is_cuda:
+            # When Triton is available, compute Flash Cross-Entropy directly
+            logits = self.lm_head(flat_hidden)
+            return fused_cross_entropy(logits, flat_targets)
+
         if chunk_size <= 0 or total_tokens <= chunk_size:
             logits = self.lm_head(flat_hidden)
             return F.cross_entropy(logits, flat_targets)
 
-        # Fused / Chunked Cross-Entropy: prevents allocating 400MB+ FP16 logits tensors in VRAM
+        # Chunked Cross-Entropy fallback for PyTorch without Triton:
         total_loss = 0.0
         for i in range(0, total_tokens, chunk_size):
             h_chunk = flat_hidden[i : i + chunk_size]

@@ -83,7 +83,6 @@ if HAS_TRITON:
 
         # 1. Compute absmean gamma
         abs_x = tl.abs(x)
-        # Sum over valid elements
         sum_abs = tl.sum(tl.where(mask, abs_x, 0.0), axis=0)
         gamma = sum_abs / D
         gamma = tl.maximum(gamma, eps)
@@ -93,7 +92,6 @@ if HAS_TRITON:
         x_scaled = x * scale
 
         # 3. Round and clamp to INT4 [-8.0, 7.0]
-        # In Triton, rounding can be done via floor(x + 0.5)
         x_rounded = tl.floor(x_scaled + 0.5)
         x_clamped = tl.maximum(tl.minimum(x_rounded, 7.0), -8.0)
         x_q = x_clamped / scale
@@ -150,7 +148,6 @@ class FusedHadamardAct4Function(torch.autograd.Function):
             D = ctx.D
             orig_shape = ctx.orig_shape
             grad_2d = grad_output.reshape(-1, D)
-            # Reverse Hadamard transform has same orthogonal structure
             grad_h = pytorch_fast_hadamard_transform(grad_2d, scale=1.0 / math.sqrt(D))
             return grad_h.reshape(orig_shape), None, None
         else:

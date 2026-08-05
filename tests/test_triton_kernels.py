@@ -1,5 +1,11 @@
 """
-Unit tests and parity verification for Triton GPU kernels and fallback implementations.
+Unit tests and parity verification for all Triton GPU kernels and fallback implementations:
+- Fused FWHT + INT4 Quantization
+- Fused Delta-SSM Recurrent State Scan
+- Fused 1.58-bit Ternary Weight Deadband Quantization
+- Fused Flash Cross-Entropy Loss
+- Fused RMSNorm & Fused SiLU Gating
+- Fused 2-Bit Ternary GEMM
 """
 
 import math
@@ -16,10 +22,18 @@ from triton_kernels import (
     fused_hadamard_act4,
     fused_delta_ssm_scan,
     fused_ternary_quant,
+    fused_cross_entropy,
+    fused_silu_gating,
+    fused_ternary_gemm,
+    FusedRMSNorm,
     pytorch_fast_hadamard_transform,
     pytorch_quantize_act_4bit,
     pytorch_delta_ssm_scan,
     pytorch_quantize_weight_ternary,
+    pytorch_cross_entropy,
+    pytorch_rmsnorm,
+    pytorch_silu_gating,
+    pytorch_ternary_gemm,
 )
 
 
@@ -99,6 +113,98 @@ def test_ternary_weight_quant_parity():
     loss.backward()
     assert W.grad is not None
     assert torch.allclose(W.grad, torch.ones_like(W) * 1.5, atol=1e-5)
+
+
+def test_cross_entropy_forward_backward_parity():
+    torch.manual_seed(42)
+    N, V = 16, 128
+    logits = torch.randn(N, V, requires_grad=True)
+    targets = torch.randint(0, V, (N,))
+
+    # Reference
+    loss_ref = pytorch_cross_entropy(logits, targets)
+    loss_ref.backward()
+    grad_ref = logits.grad.clone()
+
+    logits.grad.zero_()
+
+    # Fused
+    loss_fused = fused_cross_entropy(logits, targets)
+    loss_fused.backward()
+    grad_fused = logits.grad.clone()
+
+    assert torch.allclose(loss_ref, loss_fused, atol=1e-5), "Cross-entropy loss must match reference"
+    assert torch.allclose(grad_ref, grad_fused, atol=1e-4), "Cross-entropy gradients must match reference"
+
+
+def test_rmsnorm_forward_backward_parity():
+    torch.manual_seed(42)
+    B, L, D = 2, 8, 64
+    x = torch.randn(B, L, D, requires_grad=True)
+    weight = torch.ones(D, requires_grad=True)
+
+    # Reference
+    y_ref = pytorch_rmsnorm(x, weight)
+    loss_ref = y_ref.sum()
+    loss_ref.backward()
+    grad_x_ref = x.grad.clone()
+    grad_w_ref = weight.grad.clone()
+
+    x.grad.zero_()
+    weight.grad.zero_()
+
+    # Fused Module
+    norm = FusedRMSNorm(D)
+    norm.weight.data.copy_(weight.data)
+    y_fused = norm(x)
+    loss_fused = y_fused.sum()
+    loss_fused.backward()
+
+    assert torch.allclose(y_ref, y_fused, atol=1e-5), "RMSNorm forward output must match reference"
+    assert torch.allclose(grad_x_ref, x.grad, atol=1e-4), "RMSNorm grad_x must match reference"
+    assert torch.allclose(grad_w_ref, norm.weight.grad, atol=1e-4), "RMSNorm grad_weight must match reference"
+
+
+def test_silu_gating_parity():
+    torch.manual_seed(42)
+    B, L, D = 2, 8, 64
+    f1 = torch.randn(B, L, D)
+    f2 = torch.randn(B, L, D)
+
+    y_ref = pytorch_silu_gating(f1, f2)
+    y_fused = fused_silu_gating(f1, f2)
+
+    assert torch.allclose(y_ref, y_fused, atol=1e-5), "SiLU Gating output must match reference"
+
+
+def test_ternary_gemm_forward_backward_parity():
+    torch.manual_seed(42)
+    M, K, N = 16, 64, 32
+    x = torch.randn(M, K, requires_grad=True)
+    weight = torch.randn(N, K, requires_grad=True)
+    bias = torch.randn(N, requires_grad=True)
+
+    # Reference
+    y_ref = pytorch_ternary_gemm(x, weight, bias)
+    loss_ref = y_ref.sum()
+    loss_ref.backward()
+    grad_x_ref = x.grad.clone()
+    grad_w_ref = weight.grad.clone()
+    grad_b_ref = bias.grad.clone()
+
+    x.grad.zero_()
+    weight.grad.zero_()
+    bias.grad.zero_()
+
+    # Fused GEMM
+    y_fused = fused_ternary_gemm(x, weight, bias)
+    loss_fused = y_fused.sum()
+    loss_fused.backward()
+
+    assert torch.allclose(y_ref, y_fused, atol=1e-5), "Ternary GEMM forward output must match reference"
+    assert torch.allclose(grad_x_ref, x.grad, atol=1e-4), "Ternary GEMM grad_x must match reference"
+    assert torch.allclose(grad_w_ref, weight.grad, atol=1e-4), "Ternary GEMM grad_w must match reference"
+    assert torch.allclose(grad_b_ref, bias.grad, atol=1e-4), "Ternary GEMM grad_bias must match reference"
 
 
 if __name__ == "__main__":
