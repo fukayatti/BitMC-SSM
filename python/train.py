@@ -203,6 +203,10 @@ def main():
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--amp", action="store_true", default=torch.cuda.is_available(), help="Enable Mixed Precision (BF16/FP16)")
     parser.add_argument("--compile", action="store_true", default=False, help="Enable torch.compile acceleration")
+    parser.add_argument("--dataset", type=str, default="synthetic", choices=["synthetic", "smollm"], help="Dataset source")
+    parser.add_argument("--dataset_subset", type=str, default="cosmopedia-v2", help="SmolLM subset")
+    parser.add_argument("--num_samples", type=int, default=25000, help="Number of samples/sequences")
+    parser.add_argument("--seq_len", type=int, default=128, help="Sequence length")
     parser.add_argument("--out_bin", type=str, default="model.bin", help="Output 2-bit binary path")
     args = parser.parse_args()
 
@@ -211,11 +215,17 @@ def main():
     is_distributed = local_rank != -1
 
     if is_distributed:
-        torch.cuda.set_device(local_rank)
-        torch.distributed.init_process_group(backend="nccl")
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+            backend = "nccl"
+            device = f"cuda:{local_rank}"
+        else:
+            backend = "gloo"
+            device = "cpu"
+
+        torch.distributed.init_process_group(backend=backend)
         rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
-        device = f"cuda:{local_rank}"
     else:
         rank = 0
         world_size = 1
@@ -225,9 +235,10 @@ def main():
 
     if is_master:
         print("======================================================================")
-        print(f"⚡ Bit-MC-SSM Training on {world_size}x GPU(s) (DDP={is_distributed})")
+        print(f"⚡ Bit-MC-SSM Training on {world_size}x Device(s) (DDP={is_distributed}, backend={backend if is_distributed else 'none'})")
         print(f"   Config: d_model={args.d_model}, layers={args.n_layers}, d_state={args.d_state}")
         print(f"   Optimizations: AMP={args.amp}, compile={args.compile}, grad_accum={args.grad_accum_steps}")
+        print(f"   Dataset: {args.dataset} ({args.dataset_subset if args.dataset == 'smollm' else 'synthetic'}), Samples={args.num_samples:,}")
         print(f"   Effective Batch Size: {args.batch_size * args.grad_accum_steps * world_size}")
         print("======================================================================")
 
@@ -255,7 +266,10 @@ def main():
     # Wrap model with DDP
     if is_distributed:
         from torch.nn.parallel import DistributedDataParallel as DDP
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        if torch.cuda.is_available():
+            model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        else:
+            model = DDP(model)
 
     optimizer = GaLoreAdamW(
         model.parameters(),
@@ -265,7 +279,45 @@ def main():
         update_proj_gap=50
     )
 
-    dataset = SyntheticStoryDataset(num_samples=1000, seq_len=64, vocab_size=args.vocab_size)
+    if args.dataset == "smollm":
+        from datasets import load_dataset
+        from transformers import GPT2TokenizerFast
+
+        if is_master:
+            print(f"📥 Loading SmolLM corpus ({args.dataset_subset})...")
+        tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+        raw_data = load_dataset("HuggingFaceTB/smollm-corpus", args.dataset_subset, split="train", streaming=True)
+
+        samples = []
+        count = 0
+        for item in raw_data:
+            text = item.get("text", "").strip()
+            if len(text) < 50:
+                continue
+            toks = tokenizer.encode(text)
+            for start_idx in range(0, len(toks) - args.seq_len, args.seq_len):
+                chunk = toks[start_idx : start_idx + args.seq_len + 1]
+                if len(chunk) == args.seq_len + 1:
+                    samples.append(torch.tensor(chunk, dtype=torch.long))
+                    count += 1
+                    if count >= args.num_samples:
+                        break
+            if count >= args.num_samples:
+                break
+
+        class ListDataset(Dataset):
+            def __init__(self, s):
+                self.s = s
+            def __len__(self):
+                return len(self.s)
+            def __getitem__(self, idx):
+                seq = self.s[idx]
+                return seq[:-1], seq[1:]
+
+        dataset = ListDataset(samples)
+    else:
+        dataset = SyntheticStoryDataset(num_samples=args.num_samples, seq_len=args.seq_len, vocab_size=args.vocab_size)
+
     sampler = torch.utils.data.distributed.DistributedSampler(dataset, shuffle=True) if is_distributed else None
 
     dataloader = DataLoader(

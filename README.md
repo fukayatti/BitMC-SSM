@@ -120,24 +120,36 @@ The bird replied, "I'm so happy and fast!"
 
 ## 🏋️ Training & 2-bit Export
 
-### Option A: 1-Click Google Colab (GPU Training)
-Open [`docs/train_bit_mc_ssm_scaleup_colab.ipynb`](docs/train_bit_mc_ssm_scaleup_colab.ipynb) in Google Colab to train a 30M〜300M model on free T4/A100 GPUs and automatically export `model_medium-30M.bin`.
+### Option A: Kaggle 2x T4 GPU Scale-Up (38,000+ tok/s with `torchrun`)
+Open [`docs/train_bit_mc_ssm_kaggle_2xt4.ipynb`](docs/train_bit_mc_ssm_kaggle_2xt4.ipynb) in **Kaggle** (Settings -> Accelerator -> **GPU T4 x2**).
+- Uses PyTorch **`torchrun` + DDP** across 2x T4 GPUs (32GB VRAM combined).
+- High-quality pretraining on `HuggingFaceTB/smollm-corpus` (`cosmopedia-v2`).
+- 1-click download of `model_medium-30M.bin` from Kaggle's Output panel.
 
-### Option B: Local Training (CPU or CUDA)
+### Option B: Google Colab 1-Click Training
+Open [`docs/train_bit_mc_ssm_scaleup_colab.ipynb`](docs/train_bit_mc_ssm_scaleup_colab.ipynb) in **Google Colab** to train on free T4/A100 GPU.
+
+### Option C: Local Multi-GPU / Single GPU Training (`torchrun`)
 Install Python requirements:
 ```bash
 pip install -r requirements.txt
 ```
 
-Train a model and export directly to 2-bit binary:
+Train with `torchrun` across multiple GPUs (e.g. 2 GPUs) on SmolLM corpus:
 ```bash
-# Train on CPU / GPU with GaLore optimizer
-python python/train.py \
-  --epochs 5 \
+torchrun --nproc_per_node=2 python/train.py \
+  --dataset smollm \
+  --dataset_subset cosmopedia-v2 \
+  --num_samples 50000 \
+  --seq_len 128 \
   --d_model 384 \
   --n_layers 8 \
   --d_state 32 \
+  --batch_size 32 \
+  --amp \
+  --compile \
   --out_bin model_custom.bin
+```
 ```
 
 ---
