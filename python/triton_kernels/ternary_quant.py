@@ -34,9 +34,8 @@ def pytorch_quantize_weight_ternary(weight: torch.Tensor, tau: float = 0.85, eps
 if HAS_TRITON:
     @triton.jit
     def _ternary_quant_kernel(
-        W_ptr, W_Q_ptr,
+        W_ptr, W_Q_ptr, Gamma_ptr,
         num_elements,
-        gamma,
         tau,
         BLOCK_SIZE: tl.constexpr,
     ):
@@ -44,7 +43,8 @@ if HAS_TRITON:
         offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         mask = offs < num_elements
 
-        w = tl.load(W_ptr + offs, mask=mask, other=0.0)
+        gamma = tl.load(Gamma_ptr).to(tl.float32)
+        w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)
         w_scaled = w / gamma
 
         # Ternary {-1, 0, +1} thresholding
@@ -65,16 +65,15 @@ class FusedTernaryQuantFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, weight: torch.Tensor, tau: float = 0.85, eps: float = 1e-5):
         if HAS_TRITON and weight.is_cuda:
-            gamma = weight.abs().mean().clamp(min=eps).item()
+            gamma = weight.abs().mean().clamp(min=eps).view(1)
             num_elements = weight.numel()
             w_q = torch.empty_like(weight)
 
             BLOCK_SIZE = 1024
             grid = (triton.cdiv(num_elements, BLOCK_SIZE),)
             _ternary_quant_kernel[grid](
-                weight, w_q,
+                weight, w_q, gamma,
                 num_elements,
-                gamma,
                 tau,
                 BLOCK_SIZE=BLOCK_SIZE,
                 num_warps=4

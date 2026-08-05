@@ -168,13 +168,27 @@ def test_rmsnorm_forward_backward_parity():
 def test_silu_gating_parity():
     torch.manual_seed(42)
     B, L, D = 2, 8, 64
-    f1 = torch.randn(B, L, D)
-    f2 = torch.randn(B, L, D)
+    f1 = torch.randn(B, L, D, requires_grad=True)
+    f2 = torch.randn(B, L, D, requires_grad=True)
 
+    # Reference
     y_ref = pytorch_silu_gating(f1, f2)
+    loss_ref = y_ref.sum()
+    loss_ref.backward()
+    grad_f1_ref = f1.grad.clone()
+    grad_f2_ref = f2.grad.clone()
+
+    f1.grad.zero_()
+    f2.grad.zero_()
+
+    # Fused
     y_fused = fused_silu_gating(f1, f2)
+    loss_fused = y_fused.sum()
+    loss_fused.backward()
 
     assert torch.allclose(y_ref, y_fused, atol=1e-5), "SiLU Gating output must match reference"
+    assert torch.allclose(grad_f1_ref, f1.grad, atol=1e-4), "SiLU Gating grad_f1 must match reference"
+    assert torch.allclose(grad_f2_ref, f2.grad, atol=1e-4), "SiLU Gating grad_f2 must match reference"
 
 
 def test_ternary_gemm_forward_backward_parity():
