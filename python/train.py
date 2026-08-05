@@ -134,12 +134,36 @@ class BitMCSSM(nn.Module):
         self.final_norm = RMSNorm(d_model)
         self.lm_head = HBitLinear(d_model, vocab_size, tau=tau, use_hadamard=False)
 
-    def forward(self, idx: torch.Tensor):
+    def extract_features(self, idx: torch.Tensor):
         x = self.tok_emb(idx)
         for block in self.blocks:
             x, _ = block(x)
-        x = self.final_norm(x)
-        return self.lm_head(x)
+        return self.final_norm(x)
+
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor = None, chunk_size: int = 64):
+        hidden = self.extract_features(idx)
+        if targets is None:
+            return self.lm_head(hidden)
+
+        B, L, D = hidden.shape
+        flat_hidden = hidden.view(-1, D)
+        flat_targets = targets.view(-1)
+        total_tokens = flat_targets.numel()
+
+        if chunk_size <= 0 or total_tokens <= chunk_size:
+            logits = self.lm_head(flat_hidden)
+            return F.cross_entropy(logits, flat_targets)
+
+        # Fused / Chunked Cross-Entropy: prevents allocating 400MB+ FP16 logits tensors in VRAM
+        total_loss = 0.0
+        for i in range(0, total_tokens, chunk_size):
+            h_chunk = flat_hidden[i : i + chunk_size]
+            t_chunk = flat_targets[i : i + chunk_size]
+            logits_chunk = self.lm_head(h_chunk)
+            chunk_loss = F.cross_entropy(logits_chunk, t_chunk, reduction="sum")
+            total_loss = total_loss + chunk_loss
+
+        return total_loss / total_tokens
 
 
 class SyntheticStoryDataset(Dataset):
@@ -148,94 +172,121 @@ class SyntheticStoryDataset(Dataset):
         patterns = [
             [7454, 2402, 257, 640, 11, 20037, 2497, 257, 44152, 1757, 393, 20037, 547, 257, 2833, 4037],
             [464, 1310, 3290, 3058, 284, 862, 287, 262, 3867, 13, 6342, 547, 1266, 284, 4015],
-            [1881, 10007, 3347, 11, 3867, 1043, 257, 4454, 284, 18512, 13, 383, 1757, 547, 3772]
+            [15496, 11, 262, 3867, 373, 257, 1255, 379, 262, 983, 13, 1119, 547, 1363, 284, 883],
+            [1856, 4060, 11, 670, 318, 257, 1266, 1778, 13, 383, 1540, 423, 262, 1856, 3556, 326],
+            [2061, 318, 257, 3745, 1104, 3838, 13, 383, 2664, 284, 467, 319, 262, 3838, 290, 4831],
+            [8241, 338, 262, 1693, 11, 284, 2402, 257, 640, 13, 679, 12056, 262, 3804, 11, 290, 547],
+            [2065, 318, 257, 2220, 2438, 13, 383, 3000, 284, 1207, 262, 3948, 11, 290, 1239, 373],
+            [198, 40, 1101, 262, 3867, 13, 383, 550, 257, 649, 11, 290, 1119, 547, 1363, 13]
         ]
-        for i in range(num_samples):
-            base = patterns[i % len(patterns)]
-            repeats = (seq_len // len(base)) + 1
-            seq = (base * repeats)[:seq_len]
+        for _ in range(num_samples):
+            seq = []
+            while len(seq) < seq_len + 1:
+                seq.extend(patterns[torch.randint(0, len(patterns), (1,)).item()])
+            seq = seq[:seq_len + 1]
             self.data.append(torch.tensor(seq, dtype=torch.long))
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
-        x = self.data[idx]
-        return x[:-1], x[1:]
+        seq = self.data[idx]
+        return seq[:-1], seq[1:]
 
 
-def export_binary(model: BitMCSSM, out_path: str = "model_medium-30M.bin"):
+def export_binary(model: BitMCSSM, out_path: str):
+    """
+    Exports BitMCSSM to native packed 2-bit binary format for C++ Zero-GEMM inference.
+    """
     print(f"📦 Exporting model to 2-bit binary: {out_path}...")
-    model.eval().cpu()
     with open(out_path, "wb") as f:
         # Magic 'BSSM' = 0x4D535342
-        header = struct.pack("<IIIII", 0x4D535342, model.vocab_size, model.d_model, model.n_layers, model.d_state)
+        header = struct.pack(
+            "<IIIII",
+            0x4D535342,
+            model.vocab_size,
+            model.d_model,
+            model.n_layers,
+            model.d_state
+        )
         f.write(header)
 
-        # Embedding table
-        emb_data = model.tok_emb.weight.detach().float().numpy().tobytes()
-        f.write(emb_data)
+        # 1. Token Embeddings (FP32)
+        emb_weight = model.tok_emb.weight.detach().cpu().to(torch.float32).numpy()
+        f.write(emb_weight.tobytes())
 
-        # Layers
-        for block in model.blocks:
-            # norm1
-            f.write(block.norm1.weight.detach().float().numpy().tobytes())
+        # 2. Sequential SSM / Transformer Blocks
+        for i, block in enumerate(model.blocks):
+            # RMSNorm 1
+            f.write(block.norm1.weight.detach().cpu().to(torch.float32).numpy().tobytes())
 
-            # ssm
-            ssm = block.ssm
-            # in_proj
-            g_in, p_in = pack_ternary_weights(ssm.in_proj.weight)
+            # SSM In-Proj (Packed 2-bit + scale)
+            g_in, p_in = pack_ternary_weights(block.ssm.in_proj.weight)
             f.write(struct.pack("<f", g_in) + p_in)
-            # conv1d
-            f.write(ssm.conv1d.weight.detach().float().numpy().tobytes())
-            f.write(ssm.conv1d.bias.detach().float().numpy().tobytes())
-            # b_proj & c_proj
-            g_b, p_b = pack_ternary_weights(ssm.b_proj.weight)
+
+            # Conv1D Weight (FP32) & Bias (FP32)
+            f.write(block.ssm.conv1d.weight.detach().cpu().to(torch.float32).numpy().tobytes())
+            if block.ssm.conv1d.bias is not None:
+                f.write(block.ssm.conv1d.bias.detach().cpu().to(torch.float32).numpy().tobytes())
+            else:
+                f.write(np.zeros(model.d_model, dtype=np.float32).tobytes())
+
+            # B Proj & C Proj
+            g_b, p_b = pack_ternary_weights(block.ssm.b_proj.weight)
             f.write(struct.pack("<f", g_b) + p_b)
-            g_c, p_c = pack_ternary_weights(ssm.c_proj.weight)
+
+            g_c, p_c = pack_ternary_weights(block.ssm.c_proj.weight)
             f.write(struct.pack("<f", g_c) + p_c)
-            # decay (fast)
-            f.write(ssm.decay_fast.detach().float().numpy().tobytes())
-            # out_proj
-            g_out, p_out = pack_ternary_weights(ssm.out_proj.weight)
+
+            # Fast Decay (FP32)
+            decay_f = torch.sigmoid(block.ssm.decay_fast).detach().cpu().to(torch.float32).numpy()
+            f.write(decay_f.tobytes())
+
+            # SSM Out Proj
+            g_out, p_out = pack_ternary_weights(block.ssm.out_proj.weight)
             f.write(struct.pack("<f", g_out) + p_out)
 
-            # norm2
-            f.write(block.norm2.weight.detach().float().numpy().tobytes())
+            # RMSNorm 2
+            f.write(block.norm2.weight.detach().cpu().to(torch.float32).numpy().tobytes())
 
-            # ffn_in & ffn_out
+            # FFN In Proj & Out Proj
             g_fin, p_fin = pack_ternary_weights(block.ffn_in.weight)
             f.write(struct.pack("<f", g_fin) + p_fin)
+
             g_fout, p_fout = pack_ternary_weights(block.ffn_out.weight)
             f.write(struct.pack("<f", g_fout) + p_fout)
 
-        # Final norm & head
-        f.write(model.final_norm.weight.detach().float().numpy().tobytes())
+        # 3. Final RMSNorm
+        f.write(model.final_norm.weight.detach().cpu().to(torch.float32).numpy().tobytes())
+
+        # 4. LM Head (Packed 2-bit + scale)
         g_head, p_head = pack_ternary_weights(model.lm_head.weight)
         f.write(struct.pack("<f", g_head) + p_head)
 
-    size_mb = os.path.getsize(out_path) / (1024 * 1024)
-    print(f"✅ Exported successfully! Binary size: {size_mb:.2f} MB")
+    file_size_mb = os.path.getsize(out_path) / (1024 * 1024)
+    print(f"✅ Exported successfully! Binary size: {file_size_mb:.2f} MB\n")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Bit-MC-SSM Training & Export")
+    parser = argparse.ArgumentParser(description="BitMC-SSM Multi-GPU Pre-training & 2-bit Export Engine")
     parser.add_argument("--epochs", type=int, default=5, help="Number of training epochs")
-    parser.add_argument("--batch_size", type=int, default=8, help="Batch size per GPU")
+    parser.add_argument("--batch_size", type=int, default=32, help="Per-device batch size")
     parser.add_argument("--grad_accum_steps", type=int, default=1, help="Gradient accumulation steps")
-    parser.add_argument("--d_model", type=int, default=128, help="Hidden dimension")
-    parser.add_argument("--n_layers", type=int, default=4, help="Number of layers")
-    parser.add_argument("--d_state", type=int, default=16, help="SSM state dimension")
-    parser.add_argument("--vocab_size", type=int, default=50257, help="Vocab size")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
-    parser.add_argument("--galore_rank", type=int, default=8, help="GaLore projection rank")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--amp", action="store_true", default=torch.cuda.is_available(), help="Enable Mixed Precision (BF16/FP16)")
-    parser.add_argument("--compile", action="store_true", default=False, help="Enable torch.compile acceleration")
-    parser.add_argument("--dataset", type=str, default="synthetic", choices=["synthetic", "smollm"], help="Dataset source")
+    parser.add_argument("--lr", type=float, default=1.0e-3, help="Peak learning rate")
+    parser.add_argument("--galore_rank", type=int, default=16, help="GaLore low-rank projection rank")
+    parser.add_argument("--d_model", type=int, default=384, help="Model hidden dimension")
+    parser.add_argument("--n_layers", type=int, default=8, help="Number of layers")
+    parser.add_argument("--d_state", type=int, default=32, help="SSM state dimension")
+    parser.add_argument("--vocab_size", type=int, default=50257, help="Vocabulary size")
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device")
+    parser.add_argument("--amp", action="store_true", help="Enable Automatic Mixed Precision (FP16/BF16)")
+    parser.add_argument("--compile", action="store_true", help="Enable PyTorch 2.0+ torch.compile()")
+    parser.add_argument("--dataset", type=str, default="synthetic", choices=["synthetic", "smollm"], help="Dataset")
     parser.add_argument("--dataset_subset", type=str, default="cosmopedia-v2", help="SmolLM subset")
     parser.add_argument("--num_samples", type=int, default=25000, help="Number of samples/sequences")
     parser.add_argument("--seq_len", type=int, default=128, help="Sequence length")
+    parser.add_argument("--chunk_size", type=int, default=64, help="Chunk size for fused chunked cross-entropy loss")
+    parser.add_argument("--num_workers", type=int, default=2, help="DataLoader background worker processes")
     parser.add_argument("--save_ckpt_dir", type=str, default=None, help="Directory to save PyTorch checkpoints (.pt)")
     parser.add_argument("--save_every_epochs", type=int, default=1, help="Epoch interval for saving checkpoints")
     parser.add_argument("--resume_from", type=str, default=None, help="Path to checkpoint .pt file to resume from")
@@ -269,7 +320,7 @@ def main():
         print("======================================================================")
         print(f"⚡ Bit-MC-SSM Training on {world_size}x Device(s) (DDP={is_distributed}, backend={backend if is_distributed else 'none'})")
         print(f"   Config: d_model={args.d_model}, layers={args.n_layers}, d_state={args.d_state}")
-        print(f"   Optimizations: AMP={args.amp}, compile={args.compile}, grad_accum={args.grad_accum_steps}")
+        print(f"   Optimizations: AMP={args.amp}, compile={args.compile}, grad_accum={args.grad_accum_steps}, chunk_loss={args.chunk_size}")
         print(f"   Dataset: {args.dataset} ({args.dataset_subset if args.dataset == 'smollm' else 'synthetic'}), Samples={args.num_samples:,}")
         print(f"   Effective Batch Size: {args.batch_size * args.grad_accum_steps * world_size}")
         if args.save_ckpt_dir:
@@ -322,7 +373,13 @@ def main():
     if is_distributed:
         from torch.nn.parallel import DistributedDataParallel as DDP
         if torch.cuda.is_available():
-            model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+            model = DDP(
+                model,
+                device_ids=[local_rank],
+                output_device=local_rank,
+                find_unused_parameters=False,
+                bucket_cap_mb=25
+            )
         else:
             model = DDP(model)
 
@@ -333,10 +390,6 @@ def main():
         rank=args.galore_rank,
         update_proj_gap=50
     )
-
-    # Optimizer state
-    # Note: GaLore creates fresh low-rank subspace projections on the fly from current gradients,
-    # ensuring clean and stable continuation across different DDP rank topologies.
 
     if args.dataset == "smollm":
         from datasets import load_dataset
@@ -379,12 +432,16 @@ def main():
 
     sampler = torch.utils.data.distributed.DistributedSampler(dataset, shuffle=True) if is_distributed else None
 
+    use_workers = args.num_workers if (torch.cuda.is_available() and args.num_workers > 0) else 0
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=(sampler is None),
         sampler=sampler,
-        pin_memory=(device.startswith("cuda"))
+        num_workers=use_workers,
+        pin_memory=(device.startswith("cuda")),
+        persistent_workers=(use_workers > 0),
+        prefetch_factor=2 if use_workers > 0 else None
     )
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -415,8 +472,8 @@ def main():
             targets = targets.to(device, non_blocking=True)
 
             with torch.amp.autocast(device_type=device_type, dtype=amp_dtype, enabled=args.amp):
-                logits = model(inputs)
-                loss = F.cross_entropy(logits.view(-1, args.vocab_size), targets.view(-1))
+                # Chunked cross-entropy prevents huge 400MB+ logits allocations
+                loss = model(inputs, targets=targets, chunk_size=args.chunk_size)
                 loss = loss / args.grad_accum_steps
 
             if scaler.is_enabled():
