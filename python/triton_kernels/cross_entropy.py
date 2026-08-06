@@ -79,7 +79,6 @@ if HAS_TRITON:
         stride_ln, stride_lv,
         stride_t, stride_lse,
         N, V,
-        grad_scale,
         ignore_index,
         BLOCK_V: tl.constexpr,
     ):
@@ -106,7 +105,7 @@ if HAS_TRITON:
             probs = tl.exp(logits - lse)
             # Subtract 1.0 for the target index
             is_target = (offs == target)
-            grad_val = tl.where(is_target, probs - 1.0, probs) * grad_scale
+            grad_val = tl.where(is_target, probs - 1.0, probs)
 
             tl.store(Grad_Logits_ptr + row_idx * stride_gln + offs * stride_glv, grad_val, mask=mask)
 
@@ -162,7 +161,6 @@ class FusedCrossEntropyFunction(torch.autograd.Function):
 
         logits, targets, lse = ctx.saved_tensors
         N, V = ctx.N, ctx.V
-        grad_scale = (grad_output / N).item()
 
         grad_logits = torch.empty_like(logits)
         BLOCK_V = 1024
@@ -174,11 +172,14 @@ class FusedCrossEntropyFunction(torch.autograd.Function):
             logits.stride(0), logits.stride(1),
             targets.stride(0), lse.stride(0),
             N, V,
-            grad_scale,
             ctx.ignore_index,
             BLOCK_V=BLOCK_V,
             num_warps=4
         )
+
+        # Scale gradients directly via GPU tensor broadcast without .item() sync (Zero Graph Break)
+        grad_scale = grad_output / N
+        grad_logits.mul_(grad_scale)
 
         return grad_logits, None, None
 

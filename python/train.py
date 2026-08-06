@@ -407,6 +407,8 @@ def main():
     # Optional torch.compile (PyTorch 2.0+ automatic Triton kernel fusion)
     if args.compile:
         try:
+            import torch._dynamo
+            torch._dynamo.config.capture_scalar_outputs = True
             if is_master:
                 print("🚀 Compiling model with torch.compile(mode='reduce-overhead')...")
             model = torch.compile(model, mode="reduce-overhead")
@@ -423,6 +425,7 @@ def main():
                 device_ids=[local_rank],
                 output_device=local_rank,
                 find_unused_parameters=False,
+                gradient_as_bucket_view=True,
                 bucket_cap_mb=25
             )
         else:
