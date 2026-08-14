@@ -1,0 +1,74 @@
+import json
+import os
+
+def create_bit_clip_notebook():
+    nb = {
+        "cells": [
+            {
+                "cell_type": "markdown",
+                "metadata": {},
+                "source": [
+                    "# 🚀 Bit-CLIP: 1.58-bit Bi-Delta-SSM Vision-Language Pretraining (CIFAR-10)\n",
+                    "このノートブックでは、超省メモリな 1.58-bit 双方向 SSM を用いた画像・テキスト対照学習モデル（Bit-CLIP）を学習します。\n",
+                    "メモリ消費が非常に少ないため、**Softmax InfoNCE Loss と超巨大バッチ** の力技でモデルを訓練し、CIFAR-10 でゼロショット画像分類（Zero-Shot Classification）を行います。"
+                ]
+            },
+            {
+                "cell_type": "markdown",
+                "metadata": {},
+                "source": [
+                    "## 1. 依存ライブラリのインストールとリポジトリのクローン"
+                ]
+            },
+            {
+                "cell_type": "code",
+                "execution_count": None,
+                "metadata": {},
+                "outputs": [],
+                "source": [
+                    "!pip install -q torch torchvision transformers tqdm\n",
+                    "![ -d 'BitMC-SSM' ] || git clone https://github.com/fukayatti/BitMC-SSM.git\n",
+                    "%cd BitMC-SSM\n",
+                    "!git pull origin main"
+                ]
+            },
+            {
+                "cell_type": "markdown",
+                "metadata": {},
+                "source": [
+                    "## 2. 🔥 ギャンブル開始: 2x T4 巨大バッチ分散学習 (`torchrun`)"
+                ]
+            },
+            {
+                "cell_type": "code",
+                "execution_count": None,
+                "metadata": {},
+                "outputs": [],
+                "source": [
+                    "# 2x T4 GPU を使って 1GPU あたり 1024 バッチ（合計実効バッチサイズ 2048！）で InfoNCE 学習を回します\n",
+                    "!torchrun --nproc_per_node=2 python/train_bit_clip.py --batch_size 1024 --epochs 10"
+                ]
+            }
+        ],
+        "metadata": {
+            "kernelspec": {
+                "display_name": "Python 3",
+                "language": "python",
+                "name": "python3"
+            },
+            "language_info": {
+                "name": "python",
+                "version": "3.10"
+            }
+        },
+        "nbformat": 4,
+        "nbformat_minor": 2
+    }
+    
+    out_path = "docs/train_bit_clip_cifar10.ipynb"
+    with open(out_path, 'w', encoding='utf-8') as f:
+        json.dump(nb, f, ensure_ascii=False, indent=1)
+    print(f"✅ Created Notebook: {out_path}")
+
+if __name__ == "__main__":
+    create_bit_clip_notebook()
