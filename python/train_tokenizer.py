@@ -32,8 +32,8 @@ Usage:
   python python/train_tokenizer.py \
       --vocab_size 49152 \
       --ja_wiki_docs 8000 \
-      --ja_web_docs 8000 \
-      --en_docs 16000 \
+      --ja_web_docs 24000 \
+      --en_docs 8000 \
       --out_dir tokenizer
 """
 
@@ -61,6 +61,11 @@ def _stream_docs(dataset_name, subset, n_docs, label, cache_file, max_chars):
 
     print(f"📚 Streaming {label} ({n_docs:,} docs, capped at {max_chars:,} chars/doc)...")
     stream = load_dataset(dataset_name, subset, split="train", streaming=True) if subset else load_dataset(dataset_name, split="train", streaming=True)
+    # HF streaming iterates the dataset in on-disk shard order, not randomly.
+    # A local shuffle buffer avoids sampling a narrow, unrepresentative slice
+    # (e.g. only the first N stored documents of a crawl, which may cluster
+    # by domain/topic and under-represent things like casual internet slang).
+    stream = stream.shuffle(seed=42, buffer_size=10000)
     count = 0
     tmp_file = cache_file + ".partial"
     with open(tmp_file, "w", encoding="utf-8") as out_f:
@@ -92,8 +97,8 @@ def get_args():
     parser = argparse.ArgumentParser(description="Train a JA+EN Byte-Level BPE tokenizer for BitMC-SSM")
     parser.add_argument("--vocab_size", type=int, default=49152, help="Target vocabulary size (kept modest to stay edge-friendly)")
     parser.add_argument("--ja_wiki_docs", type=int, default=8000, help="Number of Japanese Wikipedia documents to sample")
-    parser.add_argument("--ja_web_docs", type=int, default=8000, help="Number of Japanese CC-100 (colloquial web) documents to sample")
-    parser.add_argument("--en_docs", type=int, default=16000, help="Number of English (SmolLM cosmopedia-v2) documents to sample")
+    parser.add_argument("--ja_web_docs", type=int, default=24000, help="Number of Japanese CC-100 (colloquial web) documents to sample. Weighted higher than the other sources: with a fixed vocab_size budget, BPE greedily allocates merge slots to the globally most frequent pairs, so under-sampling colloquial Japanese (slang, casual particles) starves it of vocab slots relative to English/formal text.")
+    parser.add_argument("--en_docs", type=int, default=8000, help="Number of English (SmolLM cosmopedia-v2) documents to sample")
     parser.add_argument("--max_doc_chars", type=int, default=4000, help="Truncate each document to this many characters before feeding it to the BPE trainer (caps per-document memory use; full documents aren't needed for vocabulary statistics)")
     parser.add_argument("--out_dir", type=str, default="tokenizer", help="Output directory for vocab.json / merges.txt")
     parser.add_argument("--cache_dir", type=str, default=None, help="Directory to cache streamed corpus text (defaults to <out_dir>/_corpus_cache). Delete cached files to force a fresh re-download with different doc counts or max_doc_chars.")

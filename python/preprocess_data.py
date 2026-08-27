@@ -59,9 +59,12 @@ def ja_en_mix_stream():
     budget-limited run that stops early still saw all three throughout."""
     from datasets import load_dataset
 
-    ja_wiki = iter(load_dataset("wikimedia/wikipedia", "20231101.ja", split="train", streaming=True))
-    ja_web = iter(load_dataset("range3/cc100-ja", split="train", streaming=True))
-    en_stream = iter(load_dataset("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", split="train", streaming=True))
+    # HF streaming iterates each dataset in on-disk shard order, not randomly;
+    # a local shuffle buffer avoids the base model only ever seeing whatever
+    # narrow, possibly domain-clustered slice happens to be stored first.
+    ja_wiki = iter(load_dataset("wikimedia/wikipedia", "20231101.ja", split="train", streaming=True).shuffle(seed=42, buffer_size=10000))
+    ja_web = iter(load_dataset("range3/cc100-ja", split="train", streaming=True).shuffle(seed=42, buffer_size=10000))
+    en_stream = iter(load_dataset("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", split="train", streaming=True).shuffle(seed=42, buffer_size=10000))
 
     # en_stream appears twice so English gets 2x the pull rate of each
     # individual Japanese source (i.e. EN 50% / ja_wiki 25% / ja_web 25%).
