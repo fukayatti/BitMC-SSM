@@ -23,12 +23,17 @@ instead of a silent multi-minute gap) and b) a disconnected/interrupted run
 can resume instantly from the cache on the next invocation instead of
 re-streaming from HuggingFace from scratch.
 
+Documents are capped at `--max_doc_chars` before being handed to the BPE
+trainer. Full documents aren't needed to learn subword statistics, and
+long ones (SmolLM cosmopedia-v2 especially) can blow up the trainer's
+"Count pairs" memory usage across tens of thousands of documents.
+
 Usage:
   python python/train_tokenizer.py \
       --vocab_size 49152 \
-      --ja_wiki_docs 20000 \
-      --ja_web_docs 20000 \
-      --en_docs 40000 \
+      --ja_wiki_docs 8000 \
+      --ja_web_docs 8000 \
+      --en_docs 16000 \
       --out_dir tokenizer
 """
 
@@ -39,7 +44,7 @@ import sys
 from tokenizers import ByteLevelBPETokenizer
 
 
-def _stream_docs(dataset_name, subset, n_docs, label, cache_file):
+def _stream_docs(dataset_name, subset, n_docs, label, cache_file, max_chars):
     if os.path.exists(cache_file):
         print(f"📦 Using cached {label} corpus ({cache_file})")
         count = 0
@@ -54,7 +59,7 @@ def _stream_docs(dataset_name, subset, n_docs, label, cache_file):
 
     from datasets import load_dataset
 
-    print(f"📚 Streaming {label} ({n_docs:,} docs)...")
+    print(f"📚 Streaming {label} ({n_docs:,} docs, capped at {max_chars:,} chars/doc)...")
     stream = load_dataset(dataset_name, subset, split="train", streaming=True) if subset else load_dataset(dataset_name, split="train", streaming=True)
     count = 0
     tmp_file = cache_file + ".partial"
@@ -63,6 +68,7 @@ def _stream_docs(dataset_name, subset, n_docs, label, cache_file):
             text = item.get("text", "").strip()
             if len(text) < 20:
                 continue
+            text = text[:max_chars]
             out_f.write(text.replace("\n", " ") + "\n")
             yield text
             count += 1
@@ -75,21 +81,22 @@ def _stream_docs(dataset_name, subset, n_docs, label, cache_file):
     print(f"✅ Collected {count:,} {label} documents (cached to {cache_file}).")
 
 
-def stream_corpus(ja_wiki_docs: int, ja_web_docs: int, en_docs: int, cache_dir: str):
+def stream_corpus(ja_wiki_docs: int, ja_web_docs: int, en_docs: int, cache_dir: str, max_doc_chars: int):
     os.makedirs(cache_dir, exist_ok=True)
-    yield from _stream_docs("wikimedia/wikipedia", "20231101.ja", ja_wiki_docs, "Japanese Wikipedia", os.path.join(cache_dir, "ja_wiki.txt"))
-    yield from _stream_docs("range3/cc100-ja", None, ja_web_docs, "Japanese Web (CC-100)", os.path.join(cache_dir, "ja_web.txt"))
-    yield from _stream_docs("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", en_docs, "English (SmolLM)", os.path.join(cache_dir, "en.txt"))
+    yield from _stream_docs("wikimedia/wikipedia", "20231101.ja", ja_wiki_docs, "Japanese Wikipedia", os.path.join(cache_dir, "ja_wiki.txt"), max_doc_chars)
+    yield from _stream_docs("range3/cc100-ja", None, ja_web_docs, "Japanese Web (CC-100)", os.path.join(cache_dir, "ja_web.txt"), max_doc_chars)
+    yield from _stream_docs("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", en_docs, "English (SmolLM)", os.path.join(cache_dir, "en.txt"), max_doc_chars)
 
 
 def get_args():
     parser = argparse.ArgumentParser(description="Train a JA+EN Byte-Level BPE tokenizer for BitMC-SSM")
     parser.add_argument("--vocab_size", type=int, default=49152, help="Target vocabulary size (kept modest to stay edge-friendly)")
-    parser.add_argument("--ja_wiki_docs", type=int, default=20000, help="Number of Japanese Wikipedia documents to sample")
-    parser.add_argument("--ja_web_docs", type=int, default=20000, help="Number of Japanese CC-100 (colloquial web) documents to sample")
-    parser.add_argument("--en_docs", type=int, default=40000, help="Number of English (SmolLM cosmopedia-v2) documents to sample")
+    parser.add_argument("--ja_wiki_docs", type=int, default=8000, help="Number of Japanese Wikipedia documents to sample")
+    parser.add_argument("--ja_web_docs", type=int, default=8000, help="Number of Japanese CC-100 (colloquial web) documents to sample")
+    parser.add_argument("--en_docs", type=int, default=16000, help="Number of English (SmolLM cosmopedia-v2) documents to sample")
+    parser.add_argument("--max_doc_chars", type=int, default=4000, help="Truncate each document to this many characters before feeding it to the BPE trainer (caps per-document memory use; full documents aren't needed for vocabulary statistics)")
     parser.add_argument("--out_dir", type=str, default="tokenizer", help="Output directory for vocab.json / merges.txt")
-    parser.add_argument("--cache_dir", type=str, default=None, help="Directory to cache streamed corpus text (defaults to <out_dir>/_corpus_cache). Delete cached files to force a fresh re-download with different doc counts.")
+    parser.add_argument("--cache_dir", type=str, default=None, help="Directory to cache streamed corpus text (defaults to <out_dir>/_corpus_cache). Delete cached files to force a fresh re-download with different doc counts or max_doc_chars.")
     return parser.parse_args()
 
 
@@ -100,7 +107,7 @@ def main():
 
     tokenizer = ByteLevelBPETokenizer()
     tokenizer.train_from_iterator(
-        stream_corpus(args.ja_wiki_docs, args.ja_web_docs, args.en_docs, cache_dir),
+        stream_corpus(args.ja_wiki_docs, args.ja_web_docs, args.en_docs, cache_dir, args.max_doc_chars),
         vocab_size=args.vocab_size,
         min_frequency=2,
         special_tokens=["<|endoftext|>"],
