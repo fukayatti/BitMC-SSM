@@ -1,0 +1,340 @@
+import json
+import os
+
+def create_notebook():
+    cells = [
+        {
+            "cell_type": "markdown",
+            "metadata": {},
+            "source": [
+                "# 🧪 実験: 既存BitNetモデルのFFN(MLP)重み移植は学習を速くするか？\n",
+                "\n",
+                "**仮説**: SSM部分(系列混合)はゼロから学習するしかないが、FFN(SwiGLU)は「トークンごとに独立したゲート付きMLP」という\n",
+                "インターフェースがTransformerでもSSMブロックでも同じなので、既存の学習済みBitNet系モデルのFFN重みを凍結して移植すれば、\n",
+                "SSM側がそれに合う入力分布を学習することで、完全ランダム初期化より速く収束するのではないか？\n",
+                "\n",
+                "**先行研究の根拠**: [\"Pretrained Transformers as Universal Computation Engines\" (Lu et al., 2021)](https://arxiv.org/abs/2103.05247) は、\n",
+                "事前学習済みTransformerブロックを凍結したまま全く異なるタスクに挿入しても、周囲だけ学習させれば機能することを示した。\n",
+                "ただしこれは「Attention+FFNをブロックごと・float精度で」凍結した結果であり、今回は「FFN単体・三値量子化」という\n",
+                "より条件の厳しいケースなので、**効果があるかは未検証**。だからこそ実験する。\n",
+                "\n",
+                "**ドナーモデル**: [`abideen/Bitnet-Llama-70M`](https://huggingface.co/abideen/Bitnet-Llama-70M) — \n",
+                "`hidden_size=768`(このリポジトリの\"Small\"ティアと一致)、`intermediate_size=1024`、6層。\n",
+                "FFNの次元をこれに合わせて構成すれば、パディングや変換層なしでそのまま重みをコピーできる。\n",
+                "\n",
+                "**比較する2モデル**(アーキテクチャは完全に同一、違いはFFN初期化のみ):\n",
+                "- **Variant A (transplant)**: 6層すべてのFFN(`ffn_in`/`ffn_out`)をドナーの`gate_proj`/`up_proj`/`down_proj`から初期化し、凍結(`requires_grad=False`)。SSM・埋め込み・LM headのみ学習。\n",
+                "- **Variant B (baseline)**: 完全ランダム初期化、全パラメータ学習。\n",
+                "\n",
+                "同じデータ・同じバッチ順序で同じステップ数学習し、lossの推移を比較する。\n",
+                "\n",
+                "⚠️ **GPUランタイムを使うこと**(データ準備用ノートブックと違い、今回は実際に学習を回すのでGPUが有効)。"
+            ]
+        },
+        {
+            "cell_type": "markdown",
+            "metadata": {},
+            "source": [
+                "## 1. リポジトリ取得 & 依存ライブラリ"
+            ]
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [
+                "!git clone https://github.com/fukayatti/BitMC-SSM.git\n",
+                "%cd BitMC-SSM\n",
+                "!pip install -q transformers tiktoken datasets tqdm\n",
+                "\n",
+                "import torch\n",
+                "print('CUDA available:', torch.cuda.is_available())"
+            ]
+        },
+        {
+            "cell_type": "markdown",
+            "metadata": {},
+            "source": [
+                "## 2. 動作確認用の小さいデータセットを用意\n",
+                "アーキテクチャの比較が目的なので、英語のTinyStories(既存の`preprocess_data.py`, GPT-2 BPE)で十分。"
+            ]
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [
+                "!python python/preprocess_data.py --dataset tinystories --num_samples 5000 --out /content/exp_tokens.bin"
+            ]
+        },
+        {
+            "cell_type": "markdown",
+            "metadata": {},
+            "source": [
+                "## 3. ドナーモデル(BitNet-Llama-70M)をロード"
+            ]
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [
+                "from transformers import AutoModelForCausalLM\n",
+                "\n",
+                "DONOR_ID = 'abideen/Bitnet-Llama-70M'\n",
+                "donor = AutoModelForCausalLM.from_pretrained(DONOR_ID)\n",
+                "donor_layers = donor.model.layers\n",
+                "print(f\"Donor layers: {len(donor_layers)}\")\n",
+                "print(donor.config)"
+            ]
+        },
+        {
+            "cell_type": "markdown",
+            "metadata": {},
+            "source": [
+                "## 4. 実験用モデル定義\n",
+                "`train.py`の`DeltaSSMBlock`(SSM本体, 未改変)を再利用し、FFNの中間次元だけドナーに合わせて設定できる\n",
+                "ブロックを定義する(本番の`BitMCSSMBlock`はFFN中間次元が`d_model*2`に固定なので、ここだけ実験用に別定義)。"
+            ]
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [
+                "import sys\n",
+                "sys.path.append('python')\n",
+                "import torch.nn as nn\n",
+                "import torch.nn.functional as F\n",
+                "\n",
+                "from train import DeltaSSMBlock, FusedRMSNorm\n",
+                "from h_bitlinear import HBitLinear\n",
+                "\n",
+                "D_MODEL = 768       # abideen/Bitnet-Llama-70M の hidden_size と一致\n",
+                "FFN_HIDDEN = 1024    # abideen/Bitnet-Llama-70M の intermediate_size と一致\n",
+                "N_LAYERS = 6         # ドナーの層数と一致(全層に1:1でFFNを移植するため)\n",
+                "D_STATE = 32\n",
+                "VOCAB_SIZE = 50257   # GPT-2 BPE (preprocess_data.py のデフォルトと一致)\n",
+                "\n",
+                "class ExpBlock(nn.Module):\n",
+                "    \"\"\"train.py の BitMCSSMBlock と同じ構造だが、FFN中間次元(ffn_hidden)を\n",
+                "    ドナーモデルに合わせて指定できるようにしたもの。SSM部分は完全に同じ実装。\"\"\"\n",
+                "    def __init__(self, d_model, d_state, tau, ffn_hidden):\n",
+                "        super().__init__()\n",
+                "        self.norm1 = FusedRMSNorm(d_model)\n",
+                "        self.ssm = DeltaSSMBlock(d_model=d_model, d_state=d_state, tau=tau)\n",
+                "        self.norm2 = FusedRMSNorm(d_model)\n",
+                "        self.ffn_in = HBitLinear(d_model, ffn_hidden * 2, tau=tau, use_hadamard=False)\n",
+                "        self.ffn_out = HBitLinear(ffn_hidden, d_model, tau=tau, use_hadamard=True)\n",
+                "\n",
+                "    def forward(self, x, cached_state=None):\n",
+                "        ssm_out, next_state = self.ssm(self.norm1(x), cached_state)\n",
+                "        x = x + ssm_out\n",
+                "        ffn_p = self.ffn_in(self.norm2(x))\n",
+                "        f1, f2 = ffn_p.chunk(2, dim=-1)\n",
+                "        gated = F.silu(f1) * f2\n",
+                "        x = x + self.ffn_out(gated)\n",
+                "        return x, next_state\n",
+                "\n",
+                "class ExpModel(nn.Module):\n",
+                "    def __init__(self, vocab_size, d_model, n_layers, d_state, tau=0.85, ffn_hidden=1536):\n",
+                "        super().__init__()\n",
+                "        self.tok_emb = nn.Embedding(vocab_size, d_model)\n",
+                "        self.blocks = nn.ModuleList([\n",
+                "            ExpBlock(d_model, d_state, tau, ffn_hidden) for _ in range(n_layers)\n",
+                "        ])\n",
+                "        self.final_norm = FusedRMSNorm(d_model)\n",
+                "        self.lm_head = HBitLinear(d_model, vocab_size, tau=tau, use_hadamard=False)\n",
+                "\n",
+                "    def forward(self, idx, targets=None):\n",
+                "        x = self.tok_emb(idx)\n",
+                "        for block in self.blocks:\n",
+                "            x, _ = block(x)\n",
+                "        x = self.final_norm(x)\n",
+                "        logits = self.lm_head(x)\n",
+                "        if targets is None:\n",
+                "            return logits\n",
+                "        return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))"
+            ]
+        },
+        {
+            "cell_type": "markdown",
+            "metadata": {},
+            "source": [
+                "## 5. Variant A (FFN移植・凍結) と Variant B (完全ランダム) を構築\n",
+                "同じseedで初期化してからFFN部分だけ上書きすることで、SSM・埋め込み等の初期値は2モデルで完全に揃える\n",
+                "(違いが本当にFFN移植の有無だけになるように)。"
+            ]
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [
+                "import copy\n",
+                "\n",
+                "device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')\n",
+                "\n",
+                "torch.manual_seed(42)\n",
+                "model_b_baseline = ExpModel(VOCAB_SIZE, D_MODEL, N_LAYERS, D_STATE, ffn_hidden=FFN_HIDDEN).to(device)\n",
+                "\n",
+                "# Variant A はランダム初期化の baseline を土台にコピーし、FFN部分だけドナーの重みで上書きする\n",
+                "model_a_transplant = copy.deepcopy(model_b_baseline).to(device)\n",
+                "\n",
+                "with torch.no_grad():\n",
+                "    for i in range(N_LAYERS):\n",
+                "        donor_mlp = donor_layers[i].mlp\n",
+                "        gate_w = donor_mlp.gate_proj.weight.data.to(device)   # (1024, 768)\n",
+                "        up_w = donor_mlp.up_proj.weight.data.to(device)       # (1024, 768)\n",
+                "        down_w = donor_mlp.down_proj.weight.data.to(device)   # (768, 1024)\n",
+                "\n",
+                "        ffn_in_w = torch.cat([gate_w, up_w], dim=0)  # (2048, 768) == ffn_in.weight shape\n",
+                "        assert ffn_in_w.shape == model_a_transplant.blocks[i].ffn_in.weight.shape\n",
+                "        assert down_w.shape == model_a_transplant.blocks[i].ffn_out.weight.shape\n",
+                "\n",
+                "        model_a_transplant.blocks[i].ffn_in.weight.copy_(ffn_in_w)\n",
+                "        model_a_transplant.blocks[i].ffn_out.weight.copy_(down_w)\n",
+                "        model_a_transplant.blocks[i].ffn_in.weight.requires_grad = False\n",
+                "        model_a_transplant.blocks[i].ffn_out.weight.requires_grad = False\n",
+                "\n",
+                "print(\"✅ Variant A: FFN transplanted + frozen for all\", N_LAYERS, \"layers\")\n",
+                "print(\"✅ Variant B: fully random init, fully trainable\")\n",
+                "for name, m in [('A (transplant)', model_a_transplant), ('B (baseline)', model_b_baseline)]:\n",
+                "    trainable = sum(p.numel() for p in m.parameters() if p.requires_grad)\n",
+                "    total = sum(p.numel() for p in m.parameters())\n",
+                "    print(f\"  {name}: {trainable:,} / {total:,} trainable params\")"
+            ]
+        },
+        {
+            "cell_type": "markdown",
+            "metadata": {},
+            "source": [
+                "## 6. 同一データ・同一バッチ順序で学習し、lossを比較"
+            ]
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [
+                "import numpy as np\n",
+                "\n",
+                "SEQ_LEN = 128\n",
+                "BATCH_SIZE = 16\n",
+                "N_STEPS = 300\n",
+                "LR = 3e-4\n",
+                "\n",
+                "tokens = np.memmap('/content/exp_tokens.bin', dtype=np.uint16, mode='r')\n",
+                "print(f\"Total tokens available: {len(tokens):,}\")\n",
+                "\n",
+                "# 両モデルで完全に同じバッチ順序を使うため、先にバッチのインデックスを全部生成しておく\n",
+                "rng = np.random.default_rng(123)\n",
+                "max_start = len(tokens) - SEQ_LEN - 1\n",
+                "batch_starts = [rng.integers(0, max_start, size=BATCH_SIZE) for _ in range(N_STEPS)]\n",
+                "\n",
+                "def get_batch(step_idx):\n",
+                "    starts = batch_starts[step_idx]\n",
+                "    x = np.stack([tokens[s:s+SEQ_LEN] for s in starts]).astype(np.int64)\n",
+                "    y = np.stack([tokens[s+1:s+SEQ_LEN+1] for s in starts]).astype(np.int64)\n",
+                "    return torch.from_numpy(x).to(device), torch.from_numpy(y).to(device)\n",
+                "\n",
+                "def train_variant(model, label):\n",
+                "    optimizer = torch.optim.AdamW(\n",
+                "        [p for p in model.parameters() if p.requires_grad], lr=LR\n",
+                "    )\n",
+                "    losses = []\n",
+                "    model.train()\n",
+                "    for step in range(N_STEPS):\n",
+                "        x, y = get_batch(step)\n",
+                "        optimizer.zero_grad()\n",
+                "        loss = model(x, targets=y)\n",
+                "        loss.backward()\n",
+                "        optimizer.step()\n",
+                "        losses.append(loss.item())\n",
+                "        if (step + 1) % 50 == 0:\n",
+                "            print(f\"[{label}] step {step+1}/{N_STEPS}  loss={loss.item():.4f}\")\n",
+                "    return losses\n",
+                "\n",
+                "print(\"=\"*70)\n",
+                "print(\"Training Variant B (baseline, fully random)...\")\n",
+                "losses_b = train_variant(model_b_baseline, 'B-baseline')\n",
+                "\n",
+                "print(\"=\"*70)\n",
+                "print(\"Training Variant A (FFN transplanted + frozen)...\")\n",
+                "losses_a = train_variant(model_a_transplant, 'A-transplant')"
+            ]
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [
+                "import matplotlib.pyplot as plt\n",
+                "\n",
+                "def smooth(vals, k=10):\n",
+                "    return np.convolve(vals, np.ones(k)/k, mode='valid')\n",
+                "\n",
+                "plt.figure(figsize=(10, 5))\n",
+                "plt.plot(smooth(losses_b), label='B: baseline (random init)')\n",
+                "plt.plot(smooth(losses_a), label='A: FFN transplanted + frozen')\n",
+                "plt.xlabel('Step')\n",
+                "plt.ylabel('Loss (smoothed)')\n",
+                "plt.legend()\n",
+                "plt.title('FFN Transplant vs Random Init — Training Loss')\n",
+                "plt.show()\n",
+                "\n",
+                "print(f\"Final loss (last 20 steps avg) — baseline: {np.mean(losses_b[-20:]):.4f}, transplant: {np.mean(losses_a[-20:]):.4f}\")"
+            ]
+        },
+        {
+            "cell_type": "markdown",
+            "metadata": {},
+            "source": [
+                "## 📊 結論の読み方\n",
+                "- **transplantのlossがbaselineより明確に低い/速く下がる** → FFN移植に効果あり。本番300M学習でも採用を検討する価値がある。\n",
+                "- **ほぼ差がない、またはtransplantの方が悪い** → 三値量子化の較正ミスマッチやAttention/SSMの分布差が支配的。素直にゼロから学習する方針(蒸留の活用)に絞る。\n",
+                "- この実験は300ステップ・6層・768次元という小規模設定での結果であり、300Mスケールでそのまま同じ傾向になる保証はない点に注意。"
+            ]
+        }
+    ]
+
+    notebook = {
+        "cells": cells,
+        "metadata": {
+            "kernelspec": {
+                "display_name": "Python 3",
+                "language": "python",
+                "name": "python3"
+            },
+            "language_info": {
+                "codemirror_mode": {
+                    "name": "ipython",
+                    "version": 3
+                },
+                "file_extension": ".py",
+                "mimetype": "text/x-python",
+                "name": "python",
+                "nbconvert_exporter": "python",
+                "pygments_lexer": "ipython3",
+                "version": "3.10.12"
+            }
+        },
+        "nbformat": 4,
+        "nbformat_minor": 5
+    }
+
+    os.makedirs('docs', exist_ok=True)
+    with open('docs/ffn_transplant_experiment_colab.ipynb', 'w', encoding='utf-8') as f:
+        json.dump(notebook, f, indent=2, ensure_ascii=False)
+
+    print("✅ Created Notebook: docs/ffn_transplant_experiment_colab.ipynb")
+
+if __name__ == "__main__":
+    create_notebook()
