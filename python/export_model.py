@@ -10,7 +10,28 @@ import numpy as np
 import torch
 
 MAGIC_HEADER = 0x42495453  # 'BITS' (Bit-SSM format magic number)
-VERSION = 1
+VERSION = 2  # v2: embedding table is INT8-quantized (per-row scale) instead of raw float32
+
+
+def quantize_embedding_int8(emb_tensor: torch.Tensor) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Per-row (per-token) symmetric INT8 quantization of the embedding table.
+    Ternary (2-bit) quantization is too coarse for embeddings, since each row
+    must stay distinguishable from every other token's row; INT8 keeps the
+    table's memory footprint small (1/4 of float32) without collapsing that
+    distinctiveness, which matters most for memory-constrained targets (e.g.
+    ESP32-S3) where a large vocab's float32 embedding table would otherwise
+    dominate RAM usage on its own.
+
+    Returns:
+      scales (float32 array, shape [vocab_size]): per-row dequantization scale
+      packed (int8 array, shape [vocab_size, d_model]): quantized values
+    """
+    w = emb_tensor.detach().cpu().float().numpy()
+    abs_max = np.clip(np.abs(w).max(axis=1, keepdims=True), 1e-8, None)
+    scales = (abs_max / 127.0).astype(np.float32)
+    w_int8 = np.clip(np.round(w / scales), -127, 127).astype(np.int8)
+    return scales.flatten(), w_int8
 
 def pack_ternary_weights(w_tensor: torch.Tensor) -> Tuple[float, bytes]:
     """
@@ -90,9 +111,11 @@ def export_checkpoint(checkpoint_path: str, output_bin: str, vocab_file: str = "
         )
         f.write(header_bytes)
 
-        # 2. Embedding Table [vocab_size, d_model] in float32
-        emb_weights = state_dict["embedding.weight"].detach().cpu().float().numpy().flatten()
-        f.write(emb_weights.tobytes())
+        # 2. Embedding Table [vocab_size, d_model], INT8-quantized (v2+):
+        #    [vocab_size] float32 per-row scales, then [vocab_size * d_model] int8 values
+        emb_scales, emb_q8 = quantize_embedding_int8(state_dict["embedding.weight"])
+        f.write(emb_scales.tobytes())
+        f.write(emb_q8.tobytes())
 
         # 3. Layer by Layer Export
         for l in range(n_layers):

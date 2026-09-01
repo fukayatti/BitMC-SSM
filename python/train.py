@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from python.galore_optimizer import GaLoreAdamW
 from python.h_bitlinear import HBitLinear
-from python.export_model import pack_ternary_weights
+from python.export_model import pack_ternary_weights, quantize_embedding_int8
 
 
 class RMSNorm(nn.Module):
@@ -234,20 +234,25 @@ def export_binary(model: BitMCSSM, out_path: str):
     """
     print(f"📦 Exporting model to 2-bit binary: {out_path}...")
     with open(out_path, "wb") as f:
-        # Magic 'BSSM' = 0x4D535342
+        # Magic 'BITS' = 0x42495453, version 2 (INT8-quantized embedding table)
         header = struct.pack(
-            "<IIIII",
-            0x4D535342,
+            "<IIIIIIII",
+            0x42495453,
+            2,
             model.vocab_size,
             model.d_model,
             model.n_layers,
-            model.d_state
+            model.d_state,
+            32,  # segment_len (unused by this model variant; kept for header compatibility)
+            2,   # top_k (unused by this model variant; kept for header compatibility)
         )
         f.write(header)
 
-        # 1. Token Embeddings (FP32)
-        emb_weight = model.tok_emb.weight.detach().cpu().to(torch.float32).numpy()
-        f.write(emb_weight.tobytes())
+        # 1. Token Embeddings, INT8-quantized (per-row scale) -- a raw float32 table would
+        # dominate memory on constrained targets (e.g. ESP32-S3) once vocab_size is non-trivial.
+        emb_scales, emb_q8 = quantize_embedding_int8(model.tok_emb.weight)
+        f.write(emb_scales.tobytes())
+        f.write(emb_q8.tobytes())
 
         # 2. Sequential SSM / Transformer Blocks
         for i, block in enumerate(model.blocks):

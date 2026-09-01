@@ -213,7 +213,8 @@ struct ModelRuntimeState {
 class BitMCSSMModel {
 public:
     ModelConfig config;
-    std::vector<float> embedding_table; // [vocab_size * d_model]
+    std::vector<int8_t> embedding_table_q8; // [vocab_size * d_model], INT8-quantized
+    std::vector<float> embedding_scales;    // [vocab_size], per-row dequant scale
     std::vector<BitMCSSMBlock> blocks;
     RMSNorm final_norm;
     PackedBitLinear lm_head;            // [vocab_size, d_model]
@@ -257,10 +258,35 @@ public:
         std::cout << "   Vocab Size: " << config.vocab_size << " | d_model: " << config.d_model
                   << " | Layers: " << config.n_layers << " | d_state: " << config.d_state << "\n";
 
-        // Read Embedding Table
+        // Read Embedding Table.
+        // v2+ ("BITS" with version>=2): [vocab_size] float32 scales, then
+        //   [vocab_size * d_model] int8 values (see python/export_model.py).
+        // v1 (legacy "BSSM", or "BITS" version==1): raw float32 table; quantized
+        //   to INT8 here on load so memory usage stays low regardless of which
+        //   export produced the file.
         size_t emb_size = static_cast<size_t>(config.vocab_size) * config.d_model;
-        embedding_table.resize(emb_size);
-        f.read(reinterpret_cast<char*>(embedding_table.data()), emb_size * sizeof(float));
+        embedding_scales.resize(config.vocab_size);
+        embedding_table_q8.resize(emb_size);
+
+        if (config.version >= 2) {
+            f.read(reinterpret_cast<char*>(embedding_scales.data()), config.vocab_size * sizeof(float));
+            f.read(reinterpret_cast<char*>(embedding_table_q8.data()), emb_size * sizeof(int8_t));
+        } else {
+            std::vector<float> emb_f32(emb_size);
+            f.read(reinterpret_cast<char*>(emb_f32.data()), emb_size * sizeof(float));
+            for (uint32_t t = 0; t < config.vocab_size; ++t) {
+                float max_abs = 1e-8f;
+                for (uint32_t d = 0; d < config.d_model; ++d) {
+                    max_abs = std::max(max_abs, std::abs(emb_f32[static_cast<size_t>(t) * config.d_model + d]));
+                }
+                float scale = max_abs / 127.0f;
+                embedding_scales[t] = scale;
+                for (uint32_t d = 0; d < config.d_model; ++d) {
+                    int v = static_cast<int>(std::round(emb_f32[static_cast<size_t>(t) * config.d_model + d] / scale));
+                    embedding_table_q8[static_cast<size_t>(t) * config.d_model + d] = static_cast<int8_t>(std::clamp(v, -127, 127));
+                }
+            }
+        }
 
         // Read Blocks
         blocks.resize(config.n_layers);
@@ -293,11 +319,15 @@ public:
         uint32_t d_model = config.d_model;
         uint32_t d_state = config.d_state;
 
-        // 1. Embedding Lookup
+        // 1. Embedding Lookup (dequantize this token's row only; the full table
+        // stays INT8-packed in memory, which matters most on constrained targets)
         std::vector<float> x(d_model);
         if (token_id < config.vocab_size) {
-            const float* emb_ptr = &embedding_table[static_cast<size_t>(token_id) * d_model];
-            std::memcpy(x.data(), emb_ptr, d_model * sizeof(float));
+            const int8_t* emb_ptr = &embedding_table_q8[static_cast<size_t>(token_id) * d_model];
+            float scale = embedding_scales[token_id];
+            for (uint32_t d = 0; d < d_model; ++d) {
+                x[d] = static_cast<float>(emb_ptr[d]) * scale;
+            }
         }
 
         // Intermediate buffers

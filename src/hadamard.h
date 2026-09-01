@@ -2,10 +2,13 @@
 
 #include <vector>
 #include <cmath>
-#include <immintrin.h>
 #include <cstdint>
 #include <algorithm>
 #include <cstring>
+
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 
 namespace hadamard {
 
@@ -27,15 +30,17 @@ inline void fwht(float* data, size_t n) {
         }
     }
 
-    // 2. SIMD Vectorized Scaling by 1 / sqrt(n)
+    // 2. Vectorized Scaling by 1 / sqrt(n) (AVX2 on x86, portable scalar loop elsewhere)
     float scale = 1.0f / std::sqrt(static_cast<float>(n));
     size_t i = 0;
+#if defined(__x86_64__) || defined(_M_X64)
     __m256 vscale = _mm256_set1_ps(scale);
     for (; i + 8 <= n; i += 8) {
         __m256 v = _mm256_loadu_ps(data + i);
         v = _mm256_mul_ps(v, vscale);
         _mm256_storeu_ps(data + i, v);
     }
+#endif
     for (; i < n; ++i) {
         data[i] *= scale;
     }
