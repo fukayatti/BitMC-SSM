@@ -88,24 +88,38 @@ class SpatialBiBitMCSSMBlock(nn.Module):
         return x
 
 
-class SegmentationHead(nn.Module):
-    """Projects each patch's feature vector directly to a
-    (patch_size x patch_size) block of mask logits -- no deconvolution /
-    upsampling layers, just a linear projection and a reshape back to full
-    image resolution."""
-    def __init__(self, d_model: int, patch_size: int, tau: float = 0.85):
+class ProgressiveDecoder(nn.Module):
+    """
+    Progressive Upsampling Decoder.
+    Replaces the naive patch-wise linear projection with a series of ConvTranspose2d
+    layers to gradually upsample the 16x16 SSM feature map back to full image resolution.
+    This eliminates the blocky artifacts and provides pixel-level smooth boundaries.
+    """
+    def __init__(self, d_model: int, patch_size: int = 16):
         super().__init__()
-        self.patch_size = patch_size
-        self.proj = HBitLinear(d_model, patch_size * patch_size, tau=tau, use_hadamard=False)
+        num_up = int(math.log2(patch_size))
+        assert 2**num_up == patch_size, "patch_size must be a power of 2 for ProgressiveDecoder"
+        
+        layers = []
+        in_c = d_model
+        for i in range(num_up):
+            out_c = max(8, in_c // 2)
+            layers.extend([
+                nn.ConvTranspose2d(in_c, out_c, kernel_size=2, stride=2),
+                nn.BatchNorm2d(out_c),
+                nn.SiLU(inplace=True)
+            ])
+            in_c = out_c
+            
+        self.up_blocks = nn.Sequential(*layers)
+        self.final_conv = nn.Conv2d(in_c, 1, kernel_size=3, padding=1)
 
     def forward(self, x: torch.Tensor, grid_size: tuple):
-        H, W = grid_size
         B, N, D = x.shape
-        P = self.patch_size
-        mask_patches = self.proj(x)                       # (B, N, P*P)
-        mask_patches = mask_patches.view(B, H, W, P, P)
-        mask_patches = mask_patches.permute(0, 1, 3, 2, 4)  # (B, H, P, W, P)
-        return mask_patches.reshape(B, 1, H * P, W * P)     # (B, 1, img_h, img_w) raw logits
+        H, W = grid_size
+        x = x.transpose(1, 2).view(B, D, H, W).contiguous()
+        x = self.up_blocks(x)
+        return self.final_conv(x)
 
 
 class BitSegNet(nn.Module):
@@ -131,7 +145,7 @@ class BitSegNet(nn.Module):
             for _ in range(n_layers)
         ])
         self.norm_f = FusedRMSNorm(d_model)
-        self.seg_head = SegmentationHead(d_model, patch_size, tau=tau)
+        self.seg_head = ProgressiveDecoder(d_model, patch_size)
 
     def forward(self, x: torch.Tensor):
         x = self.patch_embed(x)               # (B, D, H/P, W/P)
@@ -189,8 +203,6 @@ if __name__ == "__main__":
     total_params = sum(p.numel() for p in model.parameters())
     print(f"🧠 Model Parameters: {total_params / 1e6:.2f}M ({total_params:,} params)")
 
-    seg_head_weights = model.seg_head.proj.weight
-    gamma = seg_head_weights.abs().mean().clamp(min=1e-5)
-    w_scaled = seg_head_weights / gamma
-    zero_ratio = (w_scaled.abs() <= 0.85).float().mean().item() * 100.0
-    print(f"💎 Segmentation Head 1.58-bit Weight Zero-Sparsity: {zero_ratio:.1f}%")
+    # Removed sparsity check on seg_head because it now uses standard CNN layers
+    # instead of HBitLinear, but the core SSM blocks remain 1.58-bit.
+    print(f"💎 Decoder is now a Progressive Upsampling CNN (Smooth edges mode!)")
