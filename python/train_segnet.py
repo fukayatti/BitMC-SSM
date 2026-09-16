@@ -13,7 +13,7 @@ import torchvision.transforms as T
 
 # Import our custom models
 from bit_segnet import BitSegNet, segmentation_loss
-from galore_optimizer import GaLoreAdamW8bit
+from galore_optimizer import GaLoreAdamW
 
 class ImageMaskDataset(Dataset):
     """
@@ -170,7 +170,7 @@ def main():
             {'params': regular_params},
             {'params': galore_params, 'rank': 128, 'update_proj_gap': 200, 'scale': 0.25, 'proj_type': 'std'}
         ]
-        optimizer = GaLoreAdamW8bit(param_groups, lr=args.lr, weight_decay=0.01)
+        optimizer = GaLoreAdamW(param_groups, lr=args.lr, weight_decay=0.01)
     else:
         print("🔧 Using standard AdamW optimizer.")
         optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
