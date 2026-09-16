@@ -125,25 +125,31 @@ def main():
     # 1. Dataset & DataLoader
     print(f"📁 Loading dataset from {args.data_dir}...")
     try:
-        full_dataset = ImageMaskDataset(args.data_dir, img_size=args.img_size, is_train=True)
-        if len(full_dataset) == 0:
-            raise FileNotFoundError("Dataset is empty.")
-            
-        # 90/10 Split
-        val_size = max(1, int(0.1 * len(full_dataset)))
-        train_size = len(full_dataset) - val_size
+        train_dir = os.path.join(args.data_dir, 'train')
+        val_dir = os.path.join(args.data_dir, 'val')
         
-        # Fixed generator for reproducible splits
-        generator = torch.Generator().manual_seed(42)
-        train_dataset, val_dataset = torch.utils.data.random_split(
-            full_dataset, [train_size, val_size], generator=generator
-        )
-        
+        if os.path.exists(train_dir) and os.path.exists(val_dir):
+            print("🔍 Found explicit 'train' and 'val' splits. Bypassing random_split.")
+            train_dataset = ImageMaskDataset(train_dir, img_size=args.img_size, is_train=True)
+            val_dataset = ImageMaskDataset(val_dir, img_size=args.img_size, is_train=False)
+        else:
+            print("🔍 No explicit 'train'/'val' folders. Performing automatic 90/10 random split.")
+            full_dataset = ImageMaskDataset(args.data_dir, img_size=args.img_size, is_train=True)
+            if len(full_dataset) == 0:
+                raise FileNotFoundError("Dataset is empty.")
+                
+            val_size = max(1, int(0.1 * len(full_dataset)))
+            train_size = len(full_dataset) - val_size
+            generator = torch.Generator().manual_seed(42)
+            train_dataset, val_dataset = torch.utils.data.random_split(
+                full_dataset, [train_size, val_size], generator=generator
+            )
+
         train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, 
                                   num_workers=args.num_workers, pin_memory=True, drop_last=True)
         val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, 
                                 num_workers=args.num_workers, pin_memory=True)
-        print(f"✅ Found {len(full_dataset)} pairs. Split: {len(train_dataset)} Train, {len(val_dataset)} Val.")
+        print(f"✅ Dataset ready: {len(train_dataset)} Train, {len(val_dataset)} Val.")
     except FileNotFoundError:
         print(f"⚠️ Warning: Dataset not found at {args.data_dir}. Creating a DUMMY dataset for testing.")
         dummy = [(torch.randn(3, args.img_size, args.img_size), 
