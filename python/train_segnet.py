@@ -126,18 +126,31 @@ def main():
     # 1. Dataset & DataLoader
     print(f"📁 Loading dataset from {args.data_dir}...")
     try:
-        dataset = ImageMaskDataset(args.data_dir, img_size=args.img_size, is_train=True)
-        if len(dataset) == 0:
+        full_dataset = ImageMaskDataset(args.data_dir, img_size=args.img_size, is_train=True)
+        if len(full_dataset) == 0:
             raise FileNotFoundError("Dataset is empty.")
-        dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, 
-                                num_workers=args.num_workers, pin_memory=True, drop_last=True)
-        print(f"✅ Found {len(dataset)} image-mask pairs.")
+            
+        # 90/10 Split
+        val_size = max(1, int(0.1 * len(full_dataset)))
+        train_size = len(full_dataset) - val_size
+        
+        # Fixed generator for reproducible splits
+        generator = torch.Generator().manual_seed(42)
+        train_dataset, val_dataset = torch.utils.data.random_split(
+            full_dataset, [train_size, val_size], generator=generator
+        )
+        
+        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, 
+                                  num_workers=args.num_workers, pin_memory=True, drop_last=True)
+        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, 
+                                num_workers=args.num_workers, pin_memory=True)
+        print(f"✅ Found {len(full_dataset)} pairs. Split: {len(train_dataset)} Train, {len(val_dataset)} Val.")
     except FileNotFoundError:
         print(f"⚠️ Warning: Dataset not found at {args.data_dir}. Creating a DUMMY dataset for testing.")
-        # Create a dummy dataloader for dry-run testing
-        dataset = [(torch.randn(3, args.img_size, args.img_size), 
-                    (torch.rand(1, args.img_size, args.img_size) > 0.5).float()) for _ in range(64)]
-        dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+        dummy = [(torch.randn(3, args.img_size, args.img_size), 
+                  (torch.rand(1, args.img_size, args.img_size) > 0.5).float()) for _ in range(64)]
+        train_loader = DataLoader(dummy[:50], batch_size=args.batch_size, shuffle=True)
+        val_loader = DataLoader(dummy[50:], batch_size=args.batch_size, shuffle=False)
 
     # 2. Model
     print("🧠 Initializing Bit-SegNet...")
@@ -180,11 +193,14 @@ def main():
 
     # 4. Training Loop
     print("🚂 Starting training...")
+    best_val_loss = float('inf')
+
     for epoch in range(1, args.epochs + 1):
+        # -- TRAIN --
         model.train()
-        epoch_loss = 0.0
+        train_loss = 0.0
         
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch}/{args.epochs}")
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs} [Train]")
         for step, (images, masks) in enumerate(pbar):
             if isinstance(images, torch.Tensor):
                 images = images.to(device, non_blocking=True)
@@ -200,25 +216,52 @@ def main():
             scaler.step(optimizer)
             scaler.update()
 
-            epoch_loss += loss.item()
+            train_loss += loss.item()
             pbar.set_postfix({'loss': f"{loss.item():.4f}", 'lr': f"{scheduler.get_last_lr()[0]:.1e}"})
 
         scheduler.step()
+        avg_train_loss = train_loss / len(train_loader)
         
-        avg_loss = epoch_loss / len(dataloader)
-        print(f"📊 Epoch {epoch} complete | Avg Loss: {avg_loss:.4f}")
+        # -- VALIDATION --
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for images, masks in tqdm(val_loader, desc=f"Epoch {epoch}/{args.epochs} [Val]", leave=False):
+                if isinstance(images, torch.Tensor):
+                    images = images.to(device, non_blocking=True)
+                    masks = masks.to(device, non_blocking=True)
+                with autocast():
+                    logits = model(images)
+                    v_loss = segmentation_loss(logits, masks)
+                val_loss += v_loss.item()
+                
+        avg_val_loss = val_loss / len(val_loader)
+        print(f"📊 Epoch {epoch} complete | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
         
         # Save checkpoint
-        if epoch % 10 == 0 or epoch == args.epochs:
-            ckpt_path = os.path.join(args.output_dir, f"bit_segnet_ep{epoch:03d}.pt")
-            torch.save({
+        is_best = avg_val_loss < best_val_loss
+        if is_best:
+            best_val_loss = avg_val_loss
+            
+        if epoch % 10 == 0 or epoch == args.epochs or is_best:
+            ckpt_data = {
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'loss': avg_loss,
+                'train_loss': avg_train_loss,
+                'val_loss': avg_val_loss,
                 'args': vars(args)
-            }, ckpt_path)
-            print(f"💾 Saved checkpoint to {ckpt_path}")
+            }
+            
+            if epoch % 10 == 0 or epoch == args.epochs:
+                ckpt_path = os.path.join(args.output_dir, f"bit_segnet_ep{epoch:03d}.pt")
+                torch.save(ckpt_data, ckpt_path)
+                print(f"💾 Saved epoch checkpoint to {ckpt_path}")
+                
+            if is_best:
+                best_path = os.path.join(args.output_dir, "bit_segnet_best.pt")
+                torch.save(ckpt_data, best_path)
+                print(f"🌟 New Best Val Loss! Saved to {best_path}")
 
 if __name__ == '__main__':
     main()
