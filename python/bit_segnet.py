@@ -88,75 +88,132 @@ class SpatialBiBitMCSSMBlock(nn.Module):
         return x
 
 
-class ProgressiveDecoder(nn.Module):
-    """
-    Progressive Upsampling Decoder.
-    Replaces the naive patch-wise linear projection with a series of ConvTranspose2d
-    layers to gradually upsample the 16x16 SSM feature map back to full image resolution.
-    This eliminates the blocky artifacts and provides pixel-level smooth boundaries.
-    """
-    def __init__(self, d_model: int, patch_size: int = 16):
+class EncoderStage(nn.Module):
+    """A hierarchical stage containing downsampling and Spatial Bi-Delta-SSM blocks."""
+    def __init__(self, in_chans: int, out_chans: int, grid_size: tuple, downsample: bool = True, num_blocks: int = 1, d_state: int = 32, tau: float = 0.85):
         super().__init__()
-        num_up = int(math.log2(patch_size))
-        assert 2**num_up == patch_size, "patch_size must be a power of 2 for ProgressiveDecoder"
-        
-        layers = []
-        in_c = d_model
-        for i in range(num_up):
-            out_c = max(8, in_c // 2)
-            layers.extend([
-                nn.ConvTranspose2d(in_c, out_c, kernel_size=2, stride=2),
-                nn.BatchNorm2d(out_c),
-                nn.SiLU(inplace=True)
-            ])
-            in_c = out_c
+        self.grid_size = grid_size
+        if downsample:
+            self.down = nn.Conv2d(in_chans, out_chans, kernel_size=2, stride=2)
+        else:
+            self.down = nn.Identity()
             
-        self.up_blocks = nn.Sequential(*layers)
-        self.final_conv = nn.Conv2d(in_c, 1, kernel_size=3, padding=1)
+        num_patches = grid_size[0] * grid_size[1]
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, out_chans))
+        
+        self.blocks = nn.ModuleList([
+            SpatialBiBitMCSSMBlock(d_model=out_chans, grid_size=grid_size, d_state=d_state, tau=tau)
+            for _ in range(num_blocks)
+        ])
+        self.norm = FusedRMSNorm(out_chans)
+        
+    def forward(self, x: torch.Tensor):
+        x = self.down(x)
+        B, C, H, W = x.shape
+        x_flat = x.flatten(2).transpose(1, 2)  # (B, H*W, C)
+        x_flat = x_flat + self.pos_embed
+        
+        for block in self.blocks:
+            x_flat = block(x_flat)
+            
+        x_flat = self.norm(x_flat)
+        return x_flat.transpose(1, 2).view(B, C, H, W)
 
-    def forward(self, x: torch.Tensor, grid_size: tuple):
-        B, N, D = x.shape
-        H, W = grid_size
-        x = x.transpose(1, 2).view(B, D, H, W).contiguous()
-        x = self.up_blocks(x)
-        return self.final_conv(x)
+
+class UNetDecoder(nn.Module):
+    """
+    U-Net Decoder with Skip Connections.
+    Takes multi-scale features from the hierarchical encoder and fuses them.
+    """
+    def __init__(self, dims: list):
+        super().__init__()
+        # dims = [C, 2C, 4C, 8C]
+        self.up1 = nn.ConvTranspose2d(dims[3], dims[2], kernel_size=2, stride=2)
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(dims[2] * 2, dims[2], kernel_size=3, padding=1),
+            nn.BatchNorm2d(dims[2]),
+            nn.SiLU(inplace=True)
+        )
+        
+        self.up2 = nn.ConvTranspose2d(dims[2], dims[1], kernel_size=2, stride=2)
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(dims[1] * 2, dims[1], kernel_size=3, padding=1),
+            nn.BatchNorm2d(dims[1]),
+            nn.SiLU(inplace=True)
+        )
+        
+        self.up3 = nn.ConvTranspose2d(dims[1], dims[0], kernel_size=2, stride=2)
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(dims[0] * 2, dims[0], kernel_size=3, padding=1),
+            nn.BatchNorm2d(dims[0]),
+            nn.SiLU(inplace=True)
+        )
+        
+        # Stage 1 has H/4 resolution, so upsample by 4 to get original H
+        self.final_up = nn.Sequential(
+            nn.ConvTranspose2d(dims[0], 32, kernel_size=4, stride=4),
+            nn.BatchNorm2d(32),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(32, 1, kernel_size=3, padding=1)
+        )
+
+    def forward(self, features):
+        f1, f2, f3, f4 = features
+        
+        x = self.up1(f4)
+        x = torch.cat([x, f3], dim=1)
+        x = self.conv1(x)
+        
+        x = self.up2(x)
+        x = torch.cat([x, f2], dim=1)
+        x = self.conv2(x)
+        
+        x = self.up3(x)
+        x = torch.cat([x, f1], dim=1)
+        x = self.conv3(x)
+        
+        x = self.final_up(x)
+        return x
 
 
 class BitSegNet(nn.Module):
     """
-    1.58-bit Bi-Delta-SSM background removal network.
-    Input:  (B, 3, img_size, img_size) RGB image
-    Output: (B, 1, img_size, img_size) raw foreground-mask logits
-            (apply sigmoid for a [0,1] alpha/probability mask)
+    Bit-SegNet v3: Hierarchical U-Net with 1.58-bit Bi-Delta-SSM core.
+    Provides pixel-perfect boundaries by fusing high-res skip connections
+    with global SSM context.
     """
-    def __init__(self, img_size=256, patch_size=16, in_chans=3, d_model=384,
-                 n_layers=6, d_state=32, tau=0.85):
+    def __init__(self, img_size=256, in_chans=3, base_dim=64,
+                 depths=[1, 1, 2, 1], d_state=32, tau=0.85):
         super().__init__()
-        assert img_size % patch_size == 0, "img_size must be divisible by patch_size"
-        self.patch_size = patch_size
-        self.grid_size = (img_size // patch_size, img_size // patch_size)
-        num_patches = self.grid_size[0] * self.grid_size[1]
-
-        self.patch_embed = nn.Conv2d(in_chans, d_model, kernel_size=patch_size, stride=patch_size)
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, d_model))
-
-        self.blocks = nn.ModuleList([
-            SpatialBiBitMCSSMBlock(d_model=d_model, grid_size=self.grid_size, d_state=d_state, tau=tau)
-            for _ in range(n_layers)
-        ])
-        self.norm_f = FusedRMSNorm(d_model)
-        self.seg_head = ProgressiveDecoder(d_model, patch_size)
+        dims = [base_dim, base_dim*2, base_dim*4, base_dim*8]
+        
+        # Stage 1: H/4
+        self.patch_embed = nn.Conv2d(in_chans, dims[0], kernel_size=4, stride=4)
+        self.stage1 = EncoderStage(dims[0], dims[0], (img_size // 4, img_size // 4), 
+                                   downsample=False, num_blocks=depths[0], d_state=d_state, tau=tau)
+        
+        # Stage 2: H/8
+        self.stage2 = EncoderStage(dims[0], dims[1], (img_size // 8, img_size // 8), 
+                                   downsample=True, num_blocks=depths[1], d_state=d_state, tau=tau)
+        
+        # Stage 3: H/16
+        self.stage3 = EncoderStage(dims[1], dims[2], (img_size // 16, img_size // 16), 
+                                   downsample=True, num_blocks=depths[2], d_state=d_state, tau=tau)
+        
+        # Stage 4: H/32
+        self.stage4 = EncoderStage(dims[2], dims[3], (img_size // 32, img_size // 32), 
+                                   downsample=True, num_blocks=depths[3], d_state=d_state, tau=tau)
+        
+        self.decoder = UNetDecoder(dims)
 
     def forward(self, x: torch.Tensor):
-        x = self.patch_embed(x)               # (B, D, H/P, W/P)
-        x = x.flatten(2).transpose(1, 2)      # (B, N, D)
-        x = x + self.pos_embed
-
-        for block in self.blocks:
-            x = block(x)
-
-        x = self.norm_f(x)
-        return self.seg_head(x, self.grid_size)  # (B, 1, img_size, img_size) logits
+        x = self.patch_embed(x)
+        f1 = self.stage1(x)
+        f2 = self.stage2(f1)
+        f3 = self.stage3(f2)
+        f4 = self.stage4(f3)
+        
+        return self.decoder([f1, f2, f3, f4])
 
 
 def dice_loss(logits: torch.Tensor, targets: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -179,12 +236,12 @@ def segmentation_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tens
 
 
 if __name__ == "__main__":
-    print("🚀 Initializing Bit-SegNet (1.58-bit Bi-Delta-SSM Background Removal Network)...")
+    print("🚀 Initializing U-Bit-SegNet (v3: Hierarchical U-Net 1.58-bit SSM)...")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Tiny configuration for quick testing
-    model = BitSegNet(img_size=64, patch_size=16, d_model=128, n_layers=2).to(device)
+    # Tiny configuration for quick testing (img_size must be div by 32)
+    model = BitSegNet(img_size=64, base_dim=32, depths=[1, 1, 1, 1]).to(device)
 
     B = 2
     dummy_images = torch.randn(B, 3, 64, 64, device=device)
@@ -203,6 +260,4 @@ if __name__ == "__main__":
     total_params = sum(p.numel() for p in model.parameters())
     print(f"🧠 Model Parameters: {total_params / 1e6:.2f}M ({total_params:,} params)")
 
-    # Removed sparsity check on seg_head because it now uses standard CNN layers
-    # instead of HBitLinear, but the core SSM blocks remain 1.58-bit.
-    print(f"💎 Decoder is now a Progressive Upsampling CNN (Smooth edges mode!)")
+    print(f"💎 Decoder is now a Hierarchical U-Net with Skip Connections!")

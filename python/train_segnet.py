@@ -101,9 +101,8 @@ def get_args_parser():
     
     # Model parameters
     parser.add_argument('--img_size', default=256, type=int, help='input image size')
-    parser.add_argument('--patch_size', default=16, type=int, help='patch size for spatial SSM')
-    parser.add_argument('--d_model', default=192, type=int, help='transformer channel dimension')
-    parser.add_argument('--n_layers', default=6, type=int, help='number of SSM layers')
+    parser.add_argument('--base_dim', default=64, type=int, help='base channel dimension for stage 1')
+    parser.add_argument('--depths', default="1,1,2,1", type=str, help='number of SSM blocks per stage (comma separated)')
     
     # Training parameters
     parser.add_argument('--batch_size', default=16, type=int, help='Batch size per GPU')
@@ -153,13 +152,13 @@ def main():
         val_loader = DataLoader(dummy[50:], batch_size=args.batch_size, shuffle=False)
 
     # 2. Model
-    print("🧠 Initializing Bit-SegNet...")
+    print("🧠 Initializing U-Bit-SegNet (v3)...")
+    depths = [int(x) for x in args.depths.split(',')]
     model = BitSegNet(
         img_size=args.img_size,
-        patch_size=args.patch_size,
         in_chans=3,
-        d_model=args.d_model,
-        n_layers=args.n_layers
+        base_dim=args.base_dim,
+        depths=depths
     ).to(device)
     
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)

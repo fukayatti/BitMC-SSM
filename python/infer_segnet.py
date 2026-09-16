@@ -34,17 +34,16 @@ def main():
     # 2. Initialize Model
     # Fallback to default values if not in checkpoint (for older saves)
     img_size = ckpt_args.get('img_size', 256)
-    patch_size = ckpt_args.get('patch_size', 16)
-    d_model = ckpt_args.get('d_model', 192)
-    n_layers = ckpt_args.get('n_layers', 6)
+    base_dim = ckpt_args.get('base_dim', 64)
+    depths_str = ckpt_args.get('depths', '1,1,2,1')
+    depths = [int(x) for x in depths_str.split(',')]
 
-    print("🧠 Initializing Bit-SegNet...")
+    print("🧠 Initializing U-Bit-SegNet (v3)...")
     model = BitSegNet(
         img_size=img_size,
-        patch_size=patch_size,
         in_chans=3,
-        d_model=d_model,
-        n_layers=n_layers
+        base_dim=base_dim,
+        depths=depths
     ).to(device)
 
     model.load_state_dict(checkpoint['model_state_dict'])
