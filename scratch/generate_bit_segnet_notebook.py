@@ -8,17 +8,17 @@ def create_bit_segnet_notebook():
                 "cell_type": "markdown",
                 "metadata": {},
                 "source": [
-                    "# ✂️ Bit-SegNet: 1.58-bit Bi-Delta-SSM Background Removal Training\n",
-                    "このノートブックでは、超省メモリな 1.58-bit 双方向 SSM（Spatial 2D Scan）を用いた画像セグメンテーション（背景削除）モデルの学習を行います。\n",
-                    "\n",
-                    "GaLore オプティマイザと AMP（自動混合精度）を利用することで、無料枠の Colab T4 GPU や Kaggle Notebook でもフルスクラッチ学習が可能です。"
+                    "# ✂️ U-Bit-SegNet: 1.58-bit 最強背景削除モデル学習\n",
+                    "このノートブックでは、超省メモリな 1.58-bit双方向SSMを用いた画像セグメンテーションモデルの学習を行います。\n",
+                    "高品質な **DIS5Kデータセット** を使用し、Colabのタイムアウト対策として Google Drive を活用した最強の学習ワークフローを提供します。"
                 ]
             },
             {
                 "cell_type": "markdown",
                 "metadata": {},
                 "source": [
-                    "## 1. 依存ライブラリのインストールとリポジトリの準備"
+                    "## 1. 📂 Google Drive のマウント\n",
+                    "学習済みのモデルや、重いデータセットを退避させるために Google Drive をマウントします。"
                 ]
             },
             {
@@ -27,7 +27,24 @@ def create_bit_segnet_notebook():
                 "metadata": {},
                 "outputs": [],
                 "source": [
-                    "!pip install -q torch torchvision transformers tqdm pillow\n",
+                    "from google.colab import drive\n",
+                    "drive.mount('/content/drive')"
+                ]
+            },
+            {
+                "cell_type": "markdown",
+                "metadata": {},
+                "source": [
+                    "## 2. ⚙️ ライブラリのインストールと最新コードの取得"
+                ]
+            },
+            {
+                "cell_type": "code",
+                "execution_count": None,
+                "metadata": {},
+                "outputs": [],
+                "source": [
+                    "!pip install -q torch torchvision transformers tqdm pillow datasets\n",
                     "![ -d 'BitMC-SSM' ] || git clone https://github.com/fukayatti/BitMC-SSM.git\n",
                     "%cd BitMC-SSM\n",
                     "!git pull origin main"
@@ -37,9 +54,11 @@ def create_bit_segnet_notebook():
                 "cell_type": "markdown",
                 "metadata": {},
                 "source": [
-                    "## 2. データセットの準備 (Oxford-IIIT Pet)\n",
-                    "背景削除のベンチマークとしてよく使われる Oxford-IIIT Pet データセットをダウンロードし、前景/背景の二値マスク画像に変換します。\n",
-                    "（合計約1GBのダウンロードがあるため数分かかります）"
+                    "## 3. 📦 【初回のみ】DIS5Kデータのダウンロードと事前リサイズ\n",
+                    "**※すでにGoogle Driveに `dis5k_256.zip` を作成済みの場合は、このセルはスキップしてください。**\n",
+                    "\n",
+                    "DIS5Kは1億画素を超える巨大画像を含むため、そのまま学習に使うとCPUの画像リサイズ処理がボトルネックになり激重になります。\n",
+                    "ここでは、ダウンロード直後にあらかじめ `256x256` にリサイズし、それをZip化して Google Drive に退避させます。"
                 ]
             },
             {
@@ -48,16 +67,44 @@ def create_bit_segnet_notebook():
                 "metadata": {},
                 "outputs": [],
                 "source": [
-                    "!python python/prepare_dataset.py"
+                    "# 1. ローカルにDIS5Kをダウンロード\n",
+                    "!python python/prepare_dis5k.py --out_dir \"/content/data/dis5k\"\n",
+                    "\n",
+                    "# 2. CPU負荷対策として全画像を256x256に事前リサイズ\n",
+                    "!python python/resize_dataset.py --data_dir \"/content/data/dis5k\" --out_dir \"/content/data/dis5k_256\" --size 256\n",
+                    "\n",
+                    "# 3. 次回以降一瞬で読み込めるように、Zip化してGoogle Driveへ退避\n",
+                    "!mkdir -p /content/drive/MyDrive/BitMC-SSM\n",
+                    "!zip -q -r /content/drive/MyDrive/BitMC-SSM/dis5k_256.zip /content/data/dis5k_256\n",
+                    "print(\"✅ 初回セットアップ完了！Driveに dis5k_256.zip を保存しました。\")"
                 ]
             },
             {
                 "cell_type": "markdown",
                 "metadata": {},
                 "source": [
-                    "## 3. 🚀 Bit-SegNet の学習開始\n",
-                    "Oxford-IIIT Pet データセットを用いて学習を開始します。VRAM が厳しい場合は `--use_galore` オプションを有効にしてください。\n",
-                    "※ここではデモのため10エポックで回していますが、精度を上げる場合は 50~100エポックに設定してください。"
+                    "## 4. 🚀 【毎回実行】Driveからデータを一瞬で復元\n",
+                    "Colabのセッションがリセットされた際も、Driveに保存したZipを展開するだけで、ネットワークダウンロードやリサイズをスキップして即座に学習環境を復元できます。"
+                ]
+            },
+            {
+                "cell_type": "code",
+                "execution_count": None,
+                "metadata": {},
+                "outputs": [],
+                "source": [
+                    "!cp /content/drive/MyDrive/BitMC-SSM/dis5k_256.zip /content/\n",
+                    "!unzip -q -o /content/dis5k_256.zip -d /\n",
+                    "print(\"✅ データの復元が完了しました。学習を開始できます。\")"
+                ]
+            },
+            {
+                "cell_type": "markdown",
+                "metadata": {},
+                "source": [
+                    "## 5. 🧠 U-Bit-SegNet の学習開始\n",
+                    "すでに途中まで学習したモデルが Drive にある場合は、`--resume` に自動でパスが渡されて途中から再開します。\n",
+                    "初めて学習する場合は `--resume` にファイルが見つからなくても自動で最初からスタートします。"
                 ]
             },
             {
@@ -67,20 +114,22 @@ def create_bit_segnet_notebook():
                 "outputs": [],
                 "source": [
                     "!python python/train_segnet.py \\\n",
-                    "    --data_dir ./data/seg \\\n",
-                    "    --output_dir ./checkpoints_seg \\\n",
-                    "    --batch_size 16 \\\n",
-                    "    --epochs 10 \\\n",
-                    "    --lr 5e-4 \\\n",
-                    "    --use_galore"
+                    "    --data_dir \"/content/data/dis5k_256\" \\\n",
+                    "    --output_dir \"/content/drive/MyDrive/BitMC-SSM/checkpoints_dis5k\" \\\n",
+                    "    --resume \"/content/drive/MyDrive/BitMC-SSM/checkpoints_dis5k/bit_segnet_best.pt\" \\\n",
+                    "    --img_size 256 \\\n",
+                    "    --batch_size 64 \\\n",
+                    "    --epochs 50 \\\n",
+                    "    --base_dim 32 \\\n",
+                    "    --depths \"1,1,2,1\""
                 ]
             },
             {
                 "cell_type": "markdown",
                 "metadata": {},
                 "source": [
-                    "## 4. 🔮 推論のテスト (背景透過画像の生成)\n",
-                    "学習したチェックポイントを使って、実際に画像の背景を切り抜いてみましょう！"
+                    "## 6. 🔮 推論テスト (画像の背景切り抜き)\n",
+                    "学習した最高性能のチェックポイント(`bit_segnet_best.pt`)を使って、画像を切り抜きます。"
                 ]
             },
             {
@@ -89,33 +138,14 @@ def create_bit_segnet_notebook():
                 "metadata": {},
                 "outputs": [],
                 "source": [
-                    "import os\n",
                     "from IPython.display import Image, display\n",
                     "\n",
-                    "# データセット内の1枚の画像をテストとして使用します\n",
-                    "test_image = \"data/seg/images/Abyssinian_1.jpg\"\n",
-                    "output_image = \"result.png\"\n",
+                    "!python python/infer_segnet.py \\\n",
+                    "    --image \"/content/data/dis5k_256/val/images/1.jpg\" \\\n",
+                    "    --checkpoint \"/content/drive/MyDrive/BitMC-SSM/checkpoints_dis5k/bit_segnet_best.pt\" \\\n",
+                    "    --output \"result.png\"\n",
                     "\n",
-                    "# 最新のチェックポイントを自動取得（手動で指定してもOK）\n",
-                    "if not os.path.exists('./checkpoints_seg'):\n",
-                    "    print(\"チェックポイントが見つかりません。先に学習を実行してください。\")\n",
-                    "else:\n",
-                    "    checkpoints = sorted([f for f in os.listdir('./checkpoints_seg') if f.endswith('.pt')])\n",
-                    "    if len(checkpoints) == 0:\n",
-                    "        print(\"チェックポイントが見つかりません。先に学習を実行してください。\")\n",
-                    "    else:\n",
-                    "        latest_ckpt = os.path.join('./checkpoints_seg', checkpoints[-1])\n",
-                    "        print(f\"推論に使用するチェックポイント: {latest_ckpt}\")\n",
-                    "        \n",
-                    "        # 推論スクリプトの実行\n",
-                    "        !python python/infer_segnet.py \\\n",
-                    "            --image {test_image} \\\n",
-                    "            --checkpoint {latest_ckpt} \\\n",
-                    "            --output {output_image}\n",
-                    "    \n",
-                    "        # 結果の表示\n",
-                    "        print(\"\\n--- 🔮 切り抜き結果 ---\")\n",
-                    "        display(Image(filename=output_image))"
+                    "display(Image(\"result.png\"))"
                 ]
             }
         ],
@@ -126,18 +156,16 @@ def create_bit_segnet_notebook():
                 "name": "python3"
             },
             "language_info": {
-                "name": "python",
-                "version": "3.10"
+                "name": "python"
             }
         },
         "nbformat": 4,
-        "nbformat_minor": 2
+        "nbformat_minor": 4
     }
-    
-    out_path = "docs/train_bit_segnet.ipynb"
-    with open(out_path, 'w', encoding='utf-8') as f:
-        json.dump(nb, f, ensure_ascii=False, indent=1)
-    print(f"✅ Updated Notebook: {out_path}")
 
-if __name__ == "__main__":
+    with open('bit_segnet.ipynb', 'w') as f:
+        json.dump(nb, f, indent=2)
+    print("Created bit_segnet.ipynb with DIS5K Google Drive workflow.")
+
+if __name__ == '__main__':
     create_bit_segnet_notebook()
