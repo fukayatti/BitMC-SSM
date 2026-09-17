@@ -10,6 +10,8 @@ from torch.utils.data import Dataset, DataLoader
 from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 import torchvision.transforms as T
+import torchvision.transforms.functional as TF
+import random
 
 # Import our custom models
 from bit_segnet import BitSegNet, segmentation_loss
@@ -43,19 +45,6 @@ class ImageMaskDataset(Dataset):
         
         self.img_size = img_size
         self.is_train = is_train
-        
-        # Basic transforms (RGB images)
-        self.img_transform = T.Compose([
-            T.Resize((img_size, img_size)),
-            T.ToTensor(),
-            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
-        
-        # Mask transforms (Grayscale)
-        self.mask_transform = T.Compose([
-            T.Resize((img_size, img_size), interpolation=T.InterpolationMode.NEAREST),
-            T.ToTensor()
-        ])
 
     def __len__(self):
         return len(self.image_paths)
@@ -80,11 +69,27 @@ class ImageMaskDataset(Dataset):
         image = Image.open(img_path).convert("RGB")
         mask = Image.open(mask_path).convert("L")  # Grayscale
 
-        # Data augmentation could be added here (random flip, color jitter, etc.)
-        # For simplicity, we just apply standard resize and normalize
-        
-        image_t = self.img_transform(image)
-        mask_t = self.mask_transform(mask)
+        # 1. Resize both to target size
+        image = image.resize((self.img_size, self.img_size), Image.Resampling.BILINEAR)
+        mask = mask.resize((self.img_size, self.img_size), Image.Resampling.NEAREST)
+
+        # 2. Data Augmentation (Only for Training)
+        if self.is_train:
+            # Random Horizontal Flip
+            if random.random() > 0.5:
+                image = TF.hflip(image)
+                mask = TF.hflip(mask)
+            
+            # Random Color Jitter (Apply ONLY to image)
+            jitter = T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05)
+            image = jitter(image)
+
+        # 3. Convert to Tensor
+        image_t = TF.to_tensor(image)
+        mask_t = TF.to_tensor(mask)
+
+        # 4. Normalize Image
+        image_t = TF.normalize(image_t, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         
         # Binarize mask just in case
         mask_t = (mask_t > 0.5).float()
