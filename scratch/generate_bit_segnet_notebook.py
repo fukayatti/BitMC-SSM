@@ -54,11 +54,10 @@ def create_bit_segnet_notebook():
                 "cell_type": "markdown",
                 "metadata": {},
                 "source": [
-                    "## 3. 📦 【初回のみ】DIS5Kデータのダウンロードと事前リサイズ\n",
+                    "## 3. 📦 【初回のみ】DIS5Kデータの解凍と事前リサイズ\n",
                     "**※すでにGoogle Driveに `dis5k_256.zip` を作成済みの場合は、このセルはスキップしてください。**\n",
                     "\n",
-                    "DIS5Kは1億画素を超える巨大画像を含むため、そのまま学習に使うとCPUの画像リサイズ処理がボトルネックになり激重になります。\n",
-                    "ここでは、ダウンロード直後にあらかじめ `256x256` にリサイズし、それをZip化して Google Drive に退避させます。"
+                    "Drive上にある未リサイズの巨大なデータ（`dis5k.zip`）をローカルに持ってきて解凍し、あらかじめ `256x256` にリサイズしてから、再度Zip化して Google Drive に退避させます。"
                 ]
             },
             {
@@ -67,16 +66,16 @@ def create_bit_segnet_notebook():
                 "metadata": {},
                 "outputs": [],
                 "source": [
-                    "# 1. ローカルにDIS5Kをダウンロード\n",
-                    "!python python/prepare_dis5k.py --out_dir \"/content/data/dis5k\"\n",
+                    "# 1. 巨大な未リサイズのZipをローカルにコピーして解凍\n",
+                    "!cp /content/drive/MyDrive/BitMC-SSM/dis5k.zip /content/\n",
+                    "!unzip -q -o /content/dis5k.zip -d /\n",
                     "\n",
                     "# 2. CPU負荷対策として全画像を256x256に事前リサイズ\n",
                     "!python python/resize_dataset.py --data_dir \"/content/data/dis5k\" --out_dir \"/content/data/dis5k_256\" --size 256\n",
                     "\n",
-                    "# 3. 次回以降一瞬で読み込めるように、Zip化してGoogle Driveへ退避\n",
-                    "!mkdir -p /content/drive/MyDrive/BitMC-SSM\n",
+                    "# 3. 次回以降一瞬で読み込めるように、リサイズ済みのものをZip化してGoogle Driveへ退避\n",
                     "!zip -q -r /content/drive/MyDrive/BitMC-SSM/dis5k_256.zip /content/data/dis5k_256\n",
-                    "print(\"✅ 初回セットアップ完了！Driveに dis5k_256.zip を保存しました。\")"
+                    "print(\"✅ 初回セットアップ完了！Driveに軽量な dis5k_256.zip を保存しました。\")"
                 ]
             },
             {
