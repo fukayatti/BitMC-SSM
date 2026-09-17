@@ -1,25 +1,26 @@
 """
-Bit-SegNet: 1.58-bit Bi-Delta-SSM Background Removal / Segmentation Network
+U-Bit-SegNet: 1.58-bit Hierarchical Bi-Delta-SSM U-Net for Segmentation
 ============================================================================
-Reuses the same H-BitLinear (ternary, zero-GEMM) + Bi-Delta-SSM building
-blocks as bit_clip.py, adapted for dense per-pixel mask prediction instead
-of a single pooled embedding vector.
+Reuses the H-BitLinear (ternary, zero-GEMM) + Bi-Delta-SSM building blocks
+from bit_clip.py, but structured as a hierarchical U-Net for high-quality
+dense pixel prediction (e.g. background removal).
 
-Two changes vs. the CLIP encoder (bit_clip.py's BitImageEncoder):
+Key features (v3 Architecture):
 
-1. Spatial (2D-aware) scanning: a naive 1D raster-scan bidirectional SSM
-   (row-major flatten) loses vertical adjacency -- the patch directly above
-   another patch ends up far away in the flattened sequence. This adds a
-   second bidirectional scan along the transposed (column-major) order and
-   combines both, similar in spirit to the multi-direction scans used in
-   Vision Mamba / VMamba.
+1. Spatial (2D-aware) Cross-Scan: 
+   To maintain 2D spatial relationships, patches are scanned in both
+   row-major and column-major bidirectional orders, capturing context in 
+   all 4 directions (similar to Vision Mamba / VMamba).
 
-2. Lightweight segmentation head: instead of a CNN decoder with transposed
-   convolutions, each patch's feature vector is projected directly to a
-   (patch_size x patch_size) block of mask logits and reassembled into the
-   full-resolution mask. No upsampling layers, no skip connections yet --
-   the simplest thing that can produce a same-resolution mask; skip
-   connections can be added later if boundary sharpness needs it.
+2. Hierarchical Encoder (U-Net Contracting Path):
+   Instead of flattening the image into a single 16x16 patch sequence,
+   it starts with 4x4 patches (Stage 1) and progressively downsamples
+   spatial resolution while doubling channels (Stage 2, 3, 4).
+
+3. Skip Connections (U-Net Expanding Path):
+   A UNetDecoder uses ConvTranspose2d to upsample features, concatenating
+   them with the high-resolution skip connections (f1, f2, f3) from the 
+   encoder stages. This preserves extremely fine details like hair and whiskers.
 
 Usage: python python/bit_segnet.py  (runs a self-test forward/backward pass)
 """
