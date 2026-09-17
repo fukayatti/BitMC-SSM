@@ -110,6 +110,7 @@ def get_args_parser():
     parser.add_argument('--lr', default=5e-4, type=float, help='learning rate')
     parser.add_argument('--use_galore', action='store_true', help='Use GaLore optimizer for low memory footprint')
     parser.add_argument('--num_workers', default=4, type=int)
+    parser.add_argument('--resume', default='', type=str, help='path to checkpoint to resume from')
     
     return parser
 
@@ -199,8 +200,19 @@ def main():
     # 4. Training Loop
     print("🚂 Starting training...")
     best_val_loss = float('inf')
+    start_epoch = 1
 
-    for epoch in range(1, args.epochs + 1):
+    if args.resume and os.path.isfile(args.resume):
+        print(f"🔄 Resuming from checkpoint: {args.resume}")
+        checkpoint = torch.load(args.resume, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        if 'val_loss' in checkpoint:
+            best_val_loss = checkpoint['val_loss']
+        print(f"   -> Resumed from epoch {start_epoch - 1} with Val Loss {best_val_loss:.4f}")
+
+    for epoch in range(start_epoch, args.epochs + 1):
         # -- TRAIN --
         model.train()
         train_loss = 0.0
